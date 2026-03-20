@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "pdf-editor": {
+      "command": ".venv/bin/pdf-editor-mcp",
+      "description": "Split a merged PDF into individually-named files using a CSV/XLSX name list."
+    }
+  }
+}

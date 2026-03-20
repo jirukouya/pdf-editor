@@ -12,8 +12,12 @@ dependencies = [
   "pypdf>=6.0.0",
 ]
 
+[project.optional-dependencies]
+mcp = ["mcp>=1.0"]
+
 [project.scripts]
 pdf-editor = "pdf_editor.__main__:main"
+pdf-editor-mcp = "pdf_editor.mcp_server:main"
 
 [tool.setuptools]
 packages = ["pdf_editor"]

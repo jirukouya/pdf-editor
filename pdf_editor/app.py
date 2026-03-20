@@ -99,13 +99,31 @@ def main() -> None:
         default="",
         help="Developer testing only: comma-separated module names to simulate as missing during the first startup check.",
     )
+    # Headless / agent mode flags
+    parser.add_argument("--headless", action="store_true", help="Run without interactive prompts.")
+    parser.add_argument("--sheet", default="", help="Path to the CSV or XLSX name list.")
+    parser.add_argument("--pdf", default="", help="Path to the merged PDF to split.")
+    parser.add_argument("--pages", type=int, default=0, help="Pages per output file.")
+    parser.add_argument("--suffix", default="", help="Optional filename suffix.")
+    parser.add_argument("--output-dir", default="", dest="output_dir", help="Output directory.")
+    parser.add_argument("--name-column", default="", dest="name_column", help="Force a specific name column.")
+    parser.add_argument("--order-column", default="", dest="order_column", help="Force a specific order column (optional).")
+
     args = parser.parse_args()
     simulated_missing = parse_simulated_missing_deps(args.simulate_missing_deps)
-    try:
-        run_interactive(simulated_missing)
-    except KeyboardInterrupt:
-        print("\nCancelled.")
-        raise SystemExit(130)
+
+    if args.headless:
+        try:
+            run_headless(args)
+        except KeyboardInterrupt:
+            print("\nCancelled.")
+            raise SystemExit(130)
+    else:
+        try:
+            run_interactive(simulated_missing)
+        except KeyboardInterrupt:
+            print("\nCancelled.")
+            raise SystemExit(130)
 
 
 def run_interactive(simulated_missing: list[str] | None = None) -> None:
@@ -214,6 +232,96 @@ def run_interactive(simulated_missing: list[str] | None = None) -> None:
     result = split_pdf_named(config, records, total_pages)
     write_report(config, total_pages, len(records), warnings, result)
     show_completion(config, result)
+
+
+def run_headless(args: argparse.Namespace) -> None:
+    """Non-interactive entry point for agent / CI usage.
+
+    All required parameters must be supplied as CLI flags.
+    Prints a JSON result to stdout and exits with code 0 on success,
+    or exits with code 1 and an error message on failure.
+    """
+    import json
+
+    errors: list[str] = []
+    if not args.sheet:
+        errors.append("--sheet is required in headless mode.")
+    if not args.pdf:
+        errors.append("--pdf is required in headless mode.")
+    if not args.pages or args.pages <= 0:
+        errors.append("--pages must be a positive integer in headless mode.")
+
+    if errors:
+        for error in errors:
+            print(f"ERROR: {error}", file=sys.stderr)
+        raise SystemExit(1)
+
+    sheet_path = Path(args.sheet).expanduser()
+    pdf_path = Path(args.pdf).expanduser()
+
+    for label, path, exts in [
+        ("--sheet", sheet_path, SUPPORTED_SHEET_EXTENSIONS),
+        ("--pdf", pdf_path, {".pdf"}),
+    ]:
+        if not path.exists():
+            print(f"ERROR: {label} path does not exist: {path}", file=sys.stderr)
+            raise SystemExit(1)
+        if path.suffix.casefold() not in exts:
+            print(f"ERROR: {label} has unsupported extension '{path.suffix}'.", file=sys.stderr)
+            raise SystemExit(1)
+
+    missing = find_missing_dependencies()
+    if missing:
+        print(f"ERROR: Missing dependencies: {', '.join(missing)}", file=sys.stderr)
+        print(f"Run: {sys.executable} -m pip install {' '.join(missing)}", file=sys.stderr)
+        raise SystemExit(1)
+
+    forced_name = args.name_column or None
+    forced_order = args.order_column or None
+
+    try:
+        _, records, name_column, order_column = read_sheet_records(
+            sheet_path,
+            forced_name_column=forced_name,
+            forced_order_column=forced_order,
+        )
+    except SystemExit as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+
+    total_pages = get_pdf_page_count(pdf_path)
+    suffix = sanitize_suffix(args.suffix)
+
+    if args.output_dir:
+        output_dir = Path(args.output_dir).expanduser()
+    else:
+        output_dir = build_default_output_dir(pdf_path, suffix)
+
+    config = JobConfig(
+        sheet_path=sheet_path,
+        pdf_path=pdf_path,
+        pages_per_file=args.pages,
+        suffix=suffix,
+        output_dir=output_dir,
+        name_column=name_column,
+        order_column=order_column,
+    )
+
+    warnings = build_warnings(records, total_pages, args.pages)
+    result = split_pdf_named(config, records, total_pages)
+    write_report(config, total_pages, len(records), warnings, result)
+
+    output = {
+        "status": "ok",
+        "written": result.written,
+        "skipped_names": result.skipped_names,
+        "skipped_chunks": result.skipped_chunks,
+        "output_dir": str(output_dir),
+        "report": str(output_dir / "split_report.txt"),
+        "warnings": warnings,
+        "output_files": [str(p) for p in result.output_files],
+    }
+    print(json.dumps(output, ensure_ascii=False, indent=2))
 
 
 def run_startup_checks(simulated_missing: list[str] | None = None) -> None:
