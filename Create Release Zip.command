@@ -19,7 +19,7 @@ echo ""
 mkdir -p dist
 rm -f dist/'PDF Editor.zip'
 
-zip -r dist/'PDF Editor.zip'   'Setup PDF Editor.command'   'Launch PDF Editor.command'   'README.md'   'RELEASE_NOTES_v0.1.0.md'   'pyproject.toml'   'pdf_editor'   -x '*/__pycache__/*' '*.pyc' '.DS_Store'
+zip -r dist/'PDF Editor.zip'   'Setup PDF Editor.command'   'Launch PDF Editor.command'   'README.md'   'pyproject.toml'   'pdf_editor'   -x '*/__pycache__/*' '*.pyc' '.DS_Store'
 
 if [ $? -ne 0 ]; then
   echo ""

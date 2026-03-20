@@ -1,1 +1,0 @@
-Interactive macOS PDF splitter with CSV/XLSX naming, double-click launchers, and GitHub-ready release packaging.
