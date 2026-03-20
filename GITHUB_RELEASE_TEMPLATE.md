@@ -1,15 +1,18 @@
 # PDF EDITOR v0.1.0
 
-Interactive macOS tool for splitting a merged PDF into smaller PDFs named from a CSV or XLSX file.
+PDF EDITOR is a macOS-focused PDF splitting tool built around an interactive CLI workflow.
 
 ## Highlights
 
-- Step-by-step interactive workflow
+- Interactive step-by-step CLI workflow
 - CSV and XLSX input support
-- Automatic output folder creation
-- Filename suffix support
-- Duplicate filename auto-renaming
-- Double-click setup and launch files for non-technical users
+- macOS double-click setup and launch files
+- automatic filename suffix handling
+- automatic output folder creation
+- duplicate filename auto-renaming
+- text report generation
+- Python 3.9+ compatibility
+- local `.venv` fallback when dependency installation cannot use the system Python environment
 
 ## Download and Use
 
@@ -21,5 +24,6 @@ Interactive macOS tool for splitting a merged PDF into smaller PDFs named from a
 ## Notes
 
 - macOS may ask you to confirm opening `.command` files the first time.
-- The setup script creates a local virtual environment and installs the required dependency automatically.
+- The setup script creates a local virtual environment and installs PDF EDITOR with its dependencies.
 - This release is intended for macOS.
+- MCP server support and Agent Skills are not bundled yet; the current repository is CLI-first and ready to be wrapped by those layers later.

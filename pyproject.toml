@@ -7,7 +7,7 @@ name = "pdf-editor-cli"
 version = "0.1.0"
 description = "Interactive PDF splitting CLI for macOS workflows."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 dependencies = [
   "pypdf>=6.0.0",
 ]

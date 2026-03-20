@@ -1,7 +1,12 @@
+import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from zipfile import ZipFile
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from pdf_editor.app import (
     build_default_output_dir,
@@ -18,6 +23,7 @@ from pdf_editor.app import (
     read_sheet_records,
     sanitize_filename,
     sanitize_suffix,
+    strip_simulated_missing_args,
 )
 
 
@@ -192,6 +198,16 @@ class AppTests(unittest.TestCase):
 
     def test_parse_simulated_missing_deps(self) -> None:
         self.assertEqual(parse_simulated_missing_deps("pypdf, other "), ["pypdf", "other"])
+
+    def test_strip_simulated_missing_args(self) -> None:
+        self.assertEqual(
+            strip_simulated_missing_args(["--simulate-missing-deps", "pypdf", "--version"]),
+            ["--version"],
+        )
+        self.assertEqual(
+            strip_simulated_missing_args(["--simulate-missing-deps=pypdf", "--version"]),
+            ["--version"],
+        )
 
     def test_inspect_sheet_supports_xlsx(self) -> None:
         with TemporaryDirectory() as tmpdir:

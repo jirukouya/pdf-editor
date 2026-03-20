@@ -37,9 +37,9 @@ else
 fi
 
 echo ""
-echo "Installing required library..."
+echo "Installing PDF EDITOR and required libraries..."
 "$SCRIPT_DIR/.venv/bin/python" -m pip install --upgrade pip
-"$SCRIPT_DIR/.venv/bin/python" -m pip install pypdf
+"$SCRIPT_DIR/.venv/bin/python" -m pip install -e "$SCRIPT_DIR"
 
 if [ $? -ne 0 ]; then
   echo ""

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import importlib
+import os
 import re
 import shlex
 import subprocess
@@ -41,6 +42,8 @@ OOXML_NS = {
 }
 OFFICE_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 SUPPORTED_SHEET_EXTENSIONS = {".csv", ".xlsx"}
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+LOCAL_VENV_PYTHON = PROJECT_ROOT / ".venv" / "bin" / "python"
 
 NAME_CANDIDATES = [
     "name",
@@ -58,14 +61,14 @@ ORDER_CANDIDATES = [
 ]
 
 
-@dataclass(slots=True)
+@dataclass
 class InputRecord:
     index: int
     order: int
     name: str
 
 
-@dataclass(slots=True)
+@dataclass
 class JobConfig:
     sheet_path: Path
     pdf_path: Path
@@ -76,7 +79,7 @@ class JobConfig:
     order_column: str | None
 
 
-@dataclass(slots=True)
+@dataclass
 class SplitResult:
     written: int
     skipped_names: int
@@ -224,25 +227,27 @@ def run_startup_checks(simulated_missing: list[str] | None = None) -> None:
             print(f"- {module_name}")
 
         if prompt_yes_no("\nDo you want me to install it now?", default=True):
-            if not install_missing_dependencies(missing):
-                print("\nAutomatic installation failed.")
-                print("Please install it manually with:")
-                print(f"{sys.executable} -m pip install {' '.join(missing)}")
-                raise SystemExit(1)
+            if install_missing_dependencies(missing):
+                remaining = find_missing_dependencies()
+                if not remaining:
+                    print("\nInstallation completed successfully.")
+                    print("Startup check passed. Required libraries are installed.\n")
+                    return
+                missing = remaining
 
-            missing = find_missing_dependencies()
-            if missing:
-                print("\nInstallation finished, but these libraries are still missing:")
-                for module_name in missing:
-                    print(f"- {module_name}")
-                print("Please install them manually and try again.")
-                raise SystemExit(1)
+            if setup_local_project_environment():
+                print("\nLocal project environment is ready.")
+                print("Restarting PDF EDITOR using the local virtual environment...\n")
+                restart_with_local_venv()
 
-            print("\nInstallation completed successfully.")
-        else:
-            print("\nPlease install it manually with:")
+            print("\nAutomatic installation failed.")
+            print("Please run 'Setup PDF Editor.command' or install manually with:")
             print(f"{sys.executable} -m pip install {' '.join(missing)}")
             raise SystemExit(1)
+
+        print("\nPlease run 'Setup PDF Editor.command' or install manually with:")
+        print(f"{sys.executable} -m pip install {' '.join(missing)}")
+        raise SystemExit(1)
 
     print("Startup check passed. Required libraries are installed.\n")
 
@@ -287,6 +292,59 @@ def run_dependency_installer(module_names: list[str]) -> int:
     except OSError:
         return 1
     return completed.returncode
+
+
+def setup_local_project_environment() -> bool:
+    if is_running_inside_local_venv():
+        return False
+
+    try:
+        create_venv = subprocess.run(
+            [sys.executable, "-m", "venv", str(PROJECT_ROOT / ".venv")],
+            check=False,
+        )
+    except OSError:
+        return False
+
+    if create_venv.returncode != 0 or not LOCAL_VENV_PYTHON.exists():
+        return False
+
+    subprocess.run([str(LOCAL_VENV_PYTHON), "-m", "pip", "install", "--upgrade", "pip"], check=False)
+    install_project = subprocess.run(
+        [str(LOCAL_VENV_PYTHON), "-m", "pip", "install", "-e", str(PROJECT_ROOT)],
+        check=False,
+    )
+    return install_project.returncode == 0
+
+
+def is_running_inside_local_venv() -> bool:
+    try:
+        return Path(sys.executable).resolve() == LOCAL_VENV_PYTHON.resolve()
+    except OSError:
+        return False
+
+
+def restart_with_local_venv() -> None:
+    if not LOCAL_VENV_PYTHON.exists():
+        raise SystemExit(1)
+    restart_args = strip_simulated_missing_args(sys.argv[1:])
+    os.execv(str(LOCAL_VENV_PYTHON), [str(LOCAL_VENV_PYTHON), "-m", "pdf_editor", *restart_args])
+
+
+def strip_simulated_missing_args(args: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    skip_next = False
+    for arg in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == "--simulate-missing-deps":
+            skip_next = True
+            continue
+        if arg.startswith("--simulate-missing-deps="):
+            continue
+        cleaned.append(arg)
+    return cleaned
 
 
 def prompt_existing_file(message: str, allowed_extensions: set[str] | None = None) -> Path:
