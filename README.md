@@ -73,18 +73,6 @@ Do not commit:
 - generated output PDF folders
 - local release zip files in `dist/`
 
-## Create a GitHub Release Zip
-
-Double-click:
-
-- `Create Release Zip.command`
-
-This creates:
-
-- `dist/PDF Editor.zip`
-
-That zip file is the one you can upload to GitHub Releases for end users.
-
 ## Manual Run
 
 ```bash
