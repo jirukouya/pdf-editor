@@ -109,7 +109,7 @@ def main() -> None:
     parser.add_argument(
         "--version",
         action="version",
-        version="pdf-editor 0.1.0",
+        version="pdf-editor 0.2.0",
     )
     parser.add_argument(
         "--simulate-missing-deps",
