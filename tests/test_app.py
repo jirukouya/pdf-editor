@@ -1,3 +1,4 @@
+import argparse
 import sys
 import unittest
 from pathlib import Path
@@ -9,21 +10,32 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from pdf_editor.app import (
+    MergeConfig,
     build_default_output_dir,
+    build_default_merge_output_path,
+    build_default_merge_output_dir,
+    build_default_output_dir_label,
+    build_merge_output_filename,
     build_output_filename,
+    contains_name_placeholder,
     ensure_unique_directory_path,
     ensure_unique_path,
     find_missing_dependencies,
+    merge_pdf_files,
     inspect_sheet,
     install_missing_dependencies,
     normalize_key,
+    normalize_merge_output_path,
     parse_simulated_missing_deps,
     parse_path_input,
     pick_column,
     read_sheet_records,
+    resolve_requested_column_name,
+    run_non_interactive,
     sanitize_filename,
-    sanitize_suffix,
+    sanitize_naming_template,
     strip_simulated_missing_args,
+    validate_existing_file_path,
 )
 
 
@@ -108,19 +120,22 @@ class AppTests(unittest.TestCase):
     def test_sanitize_filename_removes_illegal_characters(self) -> None:
         self.assertEqual(sanitize_filename('A/B:C*"D"?'), "A B C D")
 
-    def test_build_output_filename_with_suffix(self) -> None:
+    def test_build_output_filename_with_template(self) -> None:
         self.assertEqual(
-            build_output_filename("Alice Tan", "EA Form Revised"),
-            "Alice Tan - EA Form Revised.pdf",
+            build_output_filename(
+                "Alice Tan",
+                "GD Pink Form - Letter of Offer ({Name}) 26-3-2026",
+            ),
+            "GD Pink Form - Letter of Offer (Alice Tan) 26-3-2026.pdf",
         )
 
-    def test_build_output_filename_without_suffix(self) -> None:
-        self.assertEqual(build_output_filename("Alice Tan", ""), "Alice Tan.pdf")
+    def test_build_output_filename_with_name_only_template(self) -> None:
+        self.assertEqual(build_output_filename("Alice Tan", "{Name}"), "Alice Tan.pdf")
 
-    def test_build_output_filename_strips_pdf_from_suffix(self) -> None:
+    def test_build_output_filename_supports_lowercase_placeholder(self) -> None:
         self.assertEqual(
-            build_output_filename("Alice Tan", "Test.pdf"),
-            "Alice Tan - Test.pdf",
+            build_output_filename("Alice Tan", "Letter ({name}).pdf"),
+            "Letter (Alice Tan).pdf",
         )
 
     def test_pick_column_ignores_case_and_spacing(self) -> None:
@@ -185,16 +200,157 @@ class AppTests(unittest.TestCase):
             unique = ensure_unique_directory_path(base)
             self.assertEqual(unique.name, "report_split_output (2)")
 
-    def test_build_default_output_dir_uses_pdf_stem(self) -> None:
+    def test_build_default_output_dir_uses_pdf_stem_for_name_only_template(self) -> None:
         pdf_path = Path("/tmp/EA Form (Updated).pdf")
-        self.assertEqual(build_default_output_dir(pdf_path, "").name, "EA Form (Updated)")
+        self.assertEqual(build_default_output_dir(pdf_path, "{Name}").name, "EA Form (Updated)")
 
-    def test_build_default_output_dir_prefers_user_suffix(self) -> None:
+    def test_build_default_output_dir_prefers_template_text(self) -> None:
         pdf_path = Path("/tmp/EA Form_removed.pdf")
-        self.assertEqual(build_default_output_dir(pdf_path, "Test").name, "Test")
+        self.assertEqual(
+            build_default_output_dir(
+                pdf_path,
+                "GD Pink Form - Letter of Offer ({Name}) 26-3-2026",
+            ).name,
+            "GD Pink Form - Letter of Offer 26-3-2026",
+        )
 
-    def test_sanitize_suffix_strips_pdf_extension(self) -> None:
-        self.assertEqual(sanitize_suffix("EA Form (Updated).pdf"), "EA Form (Updated)")
+    def test_sanitize_naming_template_strips_pdf_extension(self) -> None:
+        self.assertEqual(
+            sanitize_naming_template("GD Pink Form ({Name}).pdf"),
+            "GD Pink Form ({Name})",
+        )
+
+    def test_contains_name_placeholder_accepts_case_and_spacing(self) -> None:
+        self.assertTrue(contains_name_placeholder("Letter ({ Name })"))
+        self.assertFalse(contains_name_placeholder("Letter (Employee)"))
+
+    def test_build_default_output_dir_label_removes_empty_brackets(self) -> None:
+        self.assertEqual(
+            build_default_output_dir_label("Letter of Offer ({Name}) 26-3-2026"),
+            "Letter of Offer 26-3-2026",
+        )
+
+    def test_build_default_merge_output_dir_uses_merged_pdf_name(self) -> None:
+        pdf_path = Path("/tmp/source.pdf")
+        self.assertEqual(build_default_merge_output_dir(pdf_path).name, "Merged PDF")
+
+    def test_build_default_merge_output_path_uses_first_pdf_name(self) -> None:
+        pdf_path = Path("/tmp/Offer Letter.pdf")
+        self.assertEqual(
+            build_default_merge_output_path(pdf_path),
+            Path("/tmp/Merged PDF/Offer Letter.pdf"),
+        )
+
+    def test_build_merge_output_filename_follows_first_pdf_name(self) -> None:
+        pdf_path = Path("/tmp/Offer Letter.pdf")
+        self.assertEqual(build_merge_output_filename(pdf_path), "Offer Letter.pdf")
+
+    def test_normalize_merge_output_path_uses_default_filename_for_directory(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self.assertEqual(
+                normalize_merge_output_path(output_dir, "Offer Letter.pdf"),
+                output_dir / "Offer Letter.pdf",
+            )
+
+    def test_normalize_merge_output_path_adds_pdf_extension(self) -> None:
+        output_path = Path("/tmp/merged_output")
+        self.assertEqual(
+            normalize_merge_output_path(output_path, "Offer Letter.pdf"),
+            Path("/tmp/merged_output.pdf"),
+        )
+
+    def test_merge_pdf_files_writes_merged_output(self) -> None:
+        class FakeReader:
+            def __init__(self, path: str) -> None:
+                self.pages = [f"{Path(path).stem}-page-1", f"{Path(path).stem}-page-2"]
+
+        class FakeWriter:
+            def __init__(self) -> None:
+                self.pages: list[str] = []
+
+            def add_page(self, page: str) -> None:
+                self.pages.append(page)
+
+            def write(self, handle) -> None:
+                handle.write("\n".join(self.pages).encode("utf-8"))
+
+        with TemporaryDirectory() as tmpdir:
+            first_pdf = Path(tmpdir) / "first.pdf"
+            second_pdf = Path(tmpdir) / "second.pdf"
+            first_pdf.write_bytes(b"first")
+            second_pdf.write_bytes(b"second")
+            output_path = Path(tmpdir) / "merged.pdf"
+            config = MergeConfig(
+                first_pdf_path=first_pdf,
+                second_pdf_path=second_pdf,
+                output_path=output_path,
+            )
+
+            from unittest.mock import patch
+
+            with patch("pdf_editor.app.load_pdf_tools", return_value=(FakeReader, FakeWriter)):
+                result = merge_pdf_files(config)
+
+            self.assertEqual(result.output_path, output_path)
+            self.assertEqual(result.total_pages, 4)
+            self.assertEqual(
+                output_path.read_text(encoding="utf-8"),
+                "first-page-1\nfirst-page-2\nsecond-page-1\nsecond-page-2",
+            )
+
+    def test_validate_existing_file_path_rejects_missing_file(self) -> None:
+        with self.assertRaises(SystemExit) as context:
+            validate_existing_file_path(Path("/tmp/does-not-exist.pdf"), {".pdf"}, "PDF file")
+        self.assertIn("was not found", str(context.exception))
+
+    def test_resolve_requested_column_name_matches_case_insensitively(self) -> None:
+        self.assertEqual(
+            resolve_requested_column_name(["Full Name", "Employee No"], "full_name", "name"),
+            "Full Name",
+        )
+
+    def test_run_non_interactive_requires_split_inputs(self) -> None:
+        args = argparse.Namespace(
+            mode="split",
+            sheet_path=None,
+            pdf_path=None,
+            pages_per_file=1,
+            naming_template="{Name}",
+            output_dir=None,
+            name_column=None,
+            order_column=None,
+            first_pdf_path=None,
+            second_pdf_path=None,
+            output_path=None,
+        )
+        from unittest.mock import patch
+
+        with patch("pdf_editor.app.run_startup_checks"):
+            with self.assertRaises(SystemExit) as context:
+                run_non_interactive(args)
+        self.assertIn("--sheet-path and --pdf-path", str(context.exception))
+
+    def test_run_non_interactive_requires_merge_inputs(self) -> None:
+        args = argparse.Namespace(
+            mode="merge",
+            sheet_path=None,
+            pdf_path=None,
+            pages_per_file=1,
+            naming_template="{Name}",
+            output_dir=None,
+            name_column=None,
+            order_column=None,
+            first_pdf_path=None,
+            second_pdf_path=None,
+            output_path=None,
+        )
+        from unittest.mock import patch
+
+        with patch("pdf_editor.app.run_startup_checks"):
+            with self.assertRaises(SystemExit) as context:
+                run_non_interactive(args)
+        self.assertIn("--first-pdf-path and --second-pdf-path", str(context.exception))
 
     def test_parse_simulated_missing_deps(self) -> None:
         self.assertEqual(parse_simulated_missing_deps("pypdf, other "), ["pypdf", "other"])

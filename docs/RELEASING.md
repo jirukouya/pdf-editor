@@ -6,7 +6,7 @@ This file is for maintainers, not end users.
 
 Suggested GitHub repository description:
 
-Interactive macOS PDF splitter with CSV/XLSX naming and double-click launchers.
+Interactive macOS PDF split-and-merge tool with CSV/XLSX naming and double-click launchers.
 
 ## Release Package
 
@@ -41,12 +41,14 @@ This creates:
 ```md
 # PDF EDITOR v0.1.0
 
-PDF EDITOR is a macOS-focused tool for splitting a merged PDF into smaller PDFs named from a CSV or XLSX file.
+PDF EDITOR is a macOS-focused tool for splitting PDFs from CSV/XLSX naming data and merging two PDFs into one output file.
 
 ## Highlights
 
 - Interactive step-by-step CLI workflow
 - CSV and XLSX input support
+- custom naming template with `{Name}` placeholder
+- merge two PDFs into one output file
 - automatic output folder creation
 - duplicate filename auto-renaming
 - text report generation

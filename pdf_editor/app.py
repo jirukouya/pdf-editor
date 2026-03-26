@@ -59,6 +59,7 @@ ORDER_CANDIDATES = [
     "employee id",
     "staff id",
 ]
+NAME_PLACEHOLDER_PATTERN = re.compile(r"\{\s*name\s*\}", re.IGNORECASE)
 
 
 @dataclass
@@ -73,7 +74,7 @@ class JobConfig:
     sheet_path: Path
     pdf_path: Path
     pages_per_file: int
-    suffix: str
+    naming_template: str
     output_dir: Path
     name_column: str
     order_column: str | None
@@ -87,10 +88,23 @@ class SplitResult:
     output_files: list[Path]
 
 
+@dataclass
+class MergeConfig:
+    first_pdf_path: Path
+    second_pdf_path: Path
+    output_path: Path
+
+
+@dataclass
+class MergeResult:
+    output_path: Path
+    total_pages: int
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="pdf-editor",
-        description="Interactive PDF splitting CLI.",
+        description="Interactive PDF split-and-merge CLI.",
     )
     parser.add_argument(
         "--version",
@@ -102,10 +116,37 @@ def main() -> None:
         default="",
         help="Developer testing only: comma-separated module names to simulate as missing during the first startup check.",
     )
+    parser.add_argument(
+        "--mode",
+        choices=("split", "merge"),
+        help="Run without interactive prompts using the provided mode-specific options.",
+    )
+    parser.add_argument("--sheet-path", help="CSV/XLSX input path for split mode.")
+    parser.add_argument("--pdf-path", help="Source PDF path for split mode.")
+    parser.add_argument(
+        "--pages-per-file",
+        type=int,
+        default=1,
+        help="Pages per output PDF in split mode.",
+    )
+    parser.add_argument(
+        "--naming-template",
+        default="{Name}",
+        help="Naming template for split mode. Must include {Name}.",
+    )
+    parser.add_argument("--output-dir", help="Output directory for split mode.")
+    parser.add_argument("--name-column", help="Optional explicit name column for split mode.")
+    parser.add_argument("--order-column", help="Optional explicit order column for split mode.")
+    parser.add_argument("--first-pdf-path", help="First PDF path for merge mode.")
+    parser.add_argument("--second-pdf-path", help="Second PDF path for merge mode.")
+    parser.add_argument("--output-path", help="Merged PDF output path for merge mode.")
     args = parser.parse_args()
     simulated_missing = parse_simulated_missing_deps(args.simulate_missing_deps)
     try:
-        run_interactive(simulated_missing)
+        if args.mode:
+            run_non_interactive(args, simulated_missing)
+        else:
+            run_interactive(simulated_missing)
     except KeyboardInterrupt:
         print("\nCancelled.")
         raise SystemExit(130)
@@ -114,8 +155,109 @@ def main() -> None:
 def run_interactive(simulated_missing: list[str] | None = None) -> None:
     print(BANNER)
     print("Welcome to PDF EDITOR.")
-    print("I will guide you step by step and split your PDF for you.\n")
+    print("I can help you split or merge PDF files step by step.\n")
     run_startup_checks(simulated_missing)
+
+    operation = prompt_operation()
+    if operation == "merge":
+        run_merge_interactive()
+        return
+    run_split_interactive()
+
+
+def run_non_interactive(args: argparse.Namespace, simulated_missing: list[str] | None = None) -> None:
+    run_startup_checks(simulated_missing, interactive=False)
+    if args.mode == "split":
+        run_split_non_interactive(args)
+        return
+    run_merge_non_interactive(args)
+
+
+def run_split_non_interactive(args: argparse.Namespace) -> None:
+    if not args.sheet_path or not args.pdf_path:
+        raise SystemExit("Split mode requires --sheet-path and --pdf-path.")
+    if args.pages_per_file <= 0:
+        raise SystemExit("--pages-per-file must be greater than 0.")
+
+    sheet_path = validate_existing_file_path(
+        Path(args.sheet_path).expanduser(),
+        SUPPORTED_SHEET_EXTENSIONS,
+        "sheet file",
+    )
+    pdf_path = validate_existing_file_path(
+        Path(args.pdf_path).expanduser(),
+        {".pdf"},
+        "PDF file",
+    )
+    naming_template = sanitize_naming_template(args.naming_template or "{Name}")
+    if not contains_name_placeholder(naming_template):
+        raise SystemExit("The naming template must include {Name}.")
+
+    fieldnames = inspect_sheet(sheet_path)
+    name_column = resolve_requested_column_name(fieldnames, args.name_column, "name")
+    order_column = resolve_requested_column_name(fieldnames, args.order_column, "order")
+    _, records, detected_name_column, detected_order_column = read_sheet_records(
+        sheet_path,
+        forced_name_column=name_column,
+        forced_order_column=order_column,
+    )
+    total_pages = get_pdf_page_count(pdf_path)
+    output_dir = (
+        Path(args.output_dir).expanduser()
+        if args.output_dir
+        else build_default_output_dir(pdf_path, naming_template)
+    )
+    config = JobConfig(
+        sheet_path=sheet_path,
+        pdf_path=pdf_path,
+        pages_per_file=args.pages_per_file,
+        naming_template=naming_template,
+        output_dir=output_dir,
+        name_column=detected_name_column,
+        order_column=detected_order_column,
+    )
+    warnings = build_warnings(records, total_pages, args.pages_per_file)
+    show_summary(config, total_pages, len(records), warnings)
+    result = split_pdf_named(config, records, total_pages)
+    write_report(config, total_pages, len(records), warnings, result)
+    show_completion(config, result)
+
+
+def run_merge_non_interactive(args: argparse.Namespace) -> None:
+    if not args.first_pdf_path or not args.second_pdf_path:
+        raise SystemExit("Merge mode requires --first-pdf-path and --second-pdf-path.")
+
+    first_pdf_path = validate_existing_file_path(
+        Path(args.first_pdf_path).expanduser(),
+        {".pdf"},
+        "first PDF file",
+    )
+    second_pdf_path = validate_existing_file_path(
+        Path(args.second_pdf_path).expanduser(),
+        {".pdf"},
+        "second PDF file",
+    )
+    output_path = (
+        build_default_merge_output_path(first_pdf_path)
+        if not args.output_path
+        else normalize_merge_output_path(Path(args.output_path).expanduser(), build_merge_output_filename(first_pdf_path))
+    )
+
+    first_total_pages = get_pdf_page_count(first_pdf_path)
+    second_total_pages = get_pdf_page_count(second_pdf_path)
+    config = MergeConfig(
+        first_pdf_path=first_pdf_path,
+        second_pdf_path=second_pdf_path,
+        output_path=output_path,
+    )
+    show_merge_summary(config, first_total_pages, second_total_pages)
+    result = merge_pdf_files(config)
+    write_merge_report(config, first_total_pages, second_total_pages, result)
+    show_merge_completion(result)
+
+
+def run_split_interactive() -> None:
+    print("Selected function: Split PDF\n")
 
     sheet_path = prompt_existing_file(
         "[1/5] Where is your CSV/XLSX file?",
@@ -174,34 +316,27 @@ def run_interactive(simulated_missing: list[str] | None = None) -> None:
     )
     print(f"Each output PDF will contain {pages_per_file} page(s).")
 
-    suffix = input(
-        "\n[4/5] Enter the filename suffix after the person's name. Leave blank if not needed.\n"
-        "Example input: EA Form Revised\n"
-        "Example output: Alice Tan - EA Form Revised.pdf\n"
-        "If left blank: Alice Tan.pdf\n"
-        "> "
-    ).strip()
-    suffix = sanitize_suffix(suffix)
+    naming_template = prompt_naming_template()
 
     example_names = [record.name for record in records[:3]]
     if example_names:
         print("\nFilename preview:")
         for name in example_names:
-            print(f"- {build_output_filename(name, suffix)}")
+            print(f"- {build_output_filename(name, naming_template)}")
 
     output_dir = prompt_output_dir(
         "\n[5/5] Where should I save the generated PDFs?\n"
-        "Leave blank and I will create an output folder automatically based on your filename suffix.\n"
+        "Leave blank and I will create an output folder automatically based on your naming template.\n"
         "> ",
         pdf_path,
-        suffix,
+        naming_template,
     )
 
     config = JobConfig(
         sheet_path=sheet_path,
         pdf_path=pdf_path,
         pages_per_file=pages_per_file,
-        suffix=suffix,
+        naming_template=naming_template,
         output_dir=output_dir,
         name_column=name_column,
         order_column=order_column,
@@ -219,12 +354,61 @@ def run_interactive(simulated_missing: list[str] | None = None) -> None:
     show_completion(config, result)
 
 
-def run_startup_checks(simulated_missing: list[str] | None = None) -> None:
+def run_merge_interactive() -> None:
+    print("Selected function: Merge PDF\n")
+
+    first_pdf_path = prompt_existing_file(
+        "[1/3] Where is your first PDF file?",
+        allowed_extensions={".pdf"},
+    )
+    first_total_pages = get_pdf_page_count(first_pdf_path)
+    print(f"Loaded first PDF. Total pages: {first_total_pages}")
+
+    second_pdf_path = prompt_existing_file(
+        "\n[2/3] Where is your second PDF file?",
+        allowed_extensions={".pdf"},
+    )
+    second_total_pages = get_pdf_page_count(second_pdf_path)
+    print(f"Loaded second PDF. Total pages: {second_total_pages}")
+
+    output_path = prompt_merge_output_path(
+        "\n[3/3] Where should I save the merged PDF?\n"
+        "Leave blank and I will create a 'Merged PDF' folder automatically.\n"
+        "If you enter a folder path, I will use the first PDF filename.\n"
+        "> ",
+        first_pdf_path,
+    )
+
+    config = MergeConfig(
+        first_pdf_path=first_pdf_path,
+        second_pdf_path=second_pdf_path,
+        output_path=output_path,
+    )
+    show_merge_summary(config, first_total_pages, second_total_pages)
+
+    if not prompt_yes_no("\nDo you want to start merging now?", default=True):
+        print("Cancelled.")
+        return
+
+    result = merge_pdf_files(config)
+    write_merge_report(config, first_total_pages, second_total_pages, result)
+    show_merge_completion(result)
+
+
+def run_startup_checks(
+    simulated_missing: list[str] | None = None,
+    interactive: bool = True,
+) -> None:
     missing = find_missing_dependencies(simulated_missing=simulated_missing)
     if missing:
         print("Startup check found a missing required library:")
         for module_name in missing:
             print(f"- {module_name}")
+
+        if not interactive:
+            print("\nPlease run 'Setup PDF Editor.command' or install manually with:")
+            print(f"{sys.executable} -m pip install {' '.join(missing)}")
+            raise SystemExit(1)
 
         if prompt_yes_no("\nDo you want me to install it now?", default=True):
             if install_missing_dependencies(missing):
@@ -367,6 +551,21 @@ def prompt_existing_file(message: str, allowed_extensions: set[str] | None = Non
         return path
 
 
+def prompt_operation() -> str:
+    while True:
+        raw = input(
+            "Which function do you want to use?\n"
+            "1. Split PDF\n"
+            "2. Merge PDF\n"
+            "> "
+        ).strip().lower()
+        if raw in {"1", "split", "split pdf"}:
+            return "split"
+        if raw in {"2", "merge", "merge pdf"}:
+            return "merge"
+        print("Please choose 1 for Split PDF or 2 for Merge PDF.")
+
+
 def prompt_positive_int(message: str, default: int) -> int:
     while True:
         raw = input(f"{message}\nDefault is {default}. Press Enter to use it.\n> ").strip()
@@ -383,19 +582,54 @@ def prompt_positive_int(message: str, default: int) -> int:
         return value
 
 
-def prompt_output_dir(message: str, pdf_path: Path, suffix: str) -> Path:
+def prompt_naming_template() -> str:
+    default_template = "{Name}"
+    while True:
+        raw = input(
+            "\n[4/5] Enter the full naming template.\n"
+            "It must include {Name} so I know where to place each person's name.\n"
+            "Press Enter to use the default: {Name}\n"
+            "Example: GD Pink Form - Letter of Offer ({Name}) 26-3-2026\n"
+            "> "
+        ).strip()
+        template = sanitize_naming_template(raw or default_template)
+        if contains_name_placeholder(template):
+            return template
+        print("Your naming template must include {Name}.")
+
+
+def prompt_output_dir(message: str, pdf_path: Path, naming_template: str) -> Path:
     raw = input(message)
     path = parse_path_input(raw)
     if path:
         return path
-    auto_dir = build_default_output_dir(pdf_path, suffix)
+    auto_dir = build_default_output_dir(pdf_path, naming_template)
+    default_folder_label = sanitize_directory_name(build_default_output_dir_label(naming_template))
     print("\nNo output folder was provided.")
-    if suffix:
-        print(f'Default folder name will follow your filename suffix: "{suffix}"')
-    else:
+    if not default_folder_label:
         print(f'Default folder name will follow the source PDF name: "{pdf_path.stem}"')
+    else:
+        print(f'Default folder name will follow your naming template: "{default_folder_label}"')
     print(f"I will create this folder automatically:\n{auto_dir}")
     return auto_dir
+
+
+def prompt_merge_output_path(message: str, first_pdf_path: Path) -> Path:
+    default_filename = build_merge_output_filename(first_pdf_path)
+    raw = input(message)
+    path = parse_path_input(raw)
+    if not path:
+        output_path = build_default_merge_output_path(first_pdf_path)
+        print("\nNo output path was provided.")
+        print('Default folder name will be: "Merged PDF"')
+        print(f'Default file name will follow the first PDF: "{default_filename}"')
+        print(f"I will create this file automatically:\n{output_path}")
+        return output_path
+
+    output_path = normalize_merge_output_path(path, default_filename)
+    if path.exists() and path.is_dir():
+        print(f'I will save the merged PDF in that folder using: "{output_path.name}"')
+    return output_path
 
 
 def prompt_yes_no(message: str, default: bool) -> bool:
@@ -429,6 +663,21 @@ def prompt_optional_column_choice(message: str, fieldnames: list[str]) -> str | 
         if raw.casefold() in available:
             return available[raw.casefold()]
         print("That column was not found. Please try again or press Enter to skip.")
+
+
+def validate_existing_file_path(
+    path: Path,
+    allowed_extensions: set[str] | None = None,
+    label: str = "file",
+) -> Path:
+    if not path.exists():
+        raise SystemExit(f"The {label} was not found: {path}")
+    if not path.is_file():
+        raise SystemExit(f"The {label} is not a file: {path}")
+    if allowed_extensions and path.suffix.casefold() not in allowed_extensions:
+        allowed = ", ".join(sorted(allowed_extensions))
+        raise SystemExit(f"The {label} must use one of these extensions: {allowed}")
+    return path
 
 
 def parse_path_input(raw: str) -> Path | None:
@@ -625,6 +874,19 @@ def pick_column(fieldnames: Iterable[str], candidates: Iterable[str]) -> str | N
     return None
 
 
+def resolve_requested_column_name(
+    fieldnames: list[str],
+    requested: str | None,
+    label: str,
+) -> str | None:
+    if not requested:
+        return None
+    match = pick_column(fieldnames, [requested])
+    if match:
+        return match
+    raise SystemExit(f'The requested {label} column was not found: "{requested}"')
+
+
 def normalize_key(value: str) -> str:
     return re.sub(r"[\s_\-]+", "", value).casefold()
 
@@ -635,12 +897,9 @@ def get_pdf_page_count(pdf_path: Path) -> int:
     return len(reader.pages)
 
 
-def build_output_filename(name: str, suffix: str) -> str:
-    safe_name = sanitize_filename(name)
-    safe_suffix = sanitize_suffix(suffix)
-    if safe_suffix:
-        return f"{safe_name} - {safe_suffix}.pdf"
-    return f"{safe_name}.pdf"
+def build_output_filename(name: str, naming_template: str) -> str:
+    rendered = render_naming_template(name, naming_template)
+    return f"{sanitize_filename(rendered)}.pdf"
 
 
 def sanitize_filename(name: str) -> str:
@@ -649,11 +908,33 @@ def sanitize_filename(name: str) -> str:
     return value or "Unknown"
 
 
-def sanitize_suffix(suffix: str) -> str:
-    value = re.sub(r'[\\/:*?"<>|]+', " ", suffix).strip()
+def sanitize_naming_template(naming_template: str) -> str:
+    value = naming_template.strip()
     value = re.sub(r"\s+", " ", value)
     if value.casefold().endswith(".pdf"):
         value = value[:-4].rstrip()
+    return value
+
+
+def contains_name_placeholder(naming_template: str) -> bool:
+    return bool(NAME_PLACEHOLDER_PATTERN.search(naming_template))
+
+
+def render_naming_template(name: str, naming_template: str) -> str:
+    safe_name = sanitize_filename(name)
+    template = sanitize_naming_template(naming_template)
+    if not contains_name_placeholder(template):
+        return safe_name
+    rendered = NAME_PLACEHOLDER_PATTERN.sub(safe_name, template)
+    return re.sub(r"\s+", " ", rendered).strip() or safe_name
+
+
+def build_default_output_dir_label(naming_template: str) -> str:
+    template = sanitize_naming_template(naming_template)
+    value = NAME_PLACEHOLDER_PATTERN.sub("", template)
+    value = re.sub(r"\(\s*\)", "", value)
+    value = re.sub(r"\[\s*\]", "", value)
+    value = re.sub(r"\s+", " ", value).strip(" -_")
     return value
 
 
@@ -697,7 +978,7 @@ def show_summary(
         f"Order column            : {config.order_column if config.order_column else 'Original row order'}"
     )
     print(
-        f"Filename suffix         : {config.suffix if config.suffix else '(blank, name only)'}"
+        f"Naming template         : {config.naming_template}"
     )
     print(f"Output folder           : {config.output_dir}")
     print("\nChecks:")
@@ -725,7 +1006,7 @@ def split_pdf_named(config: JobConfig, records: list[InputRecord], total_pages: 
         for page_number in range(start, end):
             writer.add_page(reader.pages[page_number])
 
-        base_name = build_output_filename(records[idx].name, config.suffix)
+        base_name = build_output_filename(records[idx].name, config.naming_template)
         output_path = ensure_unique_path(config.output_dir / base_name)
         with output_path.open("wb") as handle:
             writer.write(handle)
@@ -739,6 +1020,37 @@ def split_pdf_named(config: JobConfig, records: list[InputRecord], total_pages: 
         skipped_chunks=max(0, chunk_count - limit),
         output_files=output_files,
     )
+
+
+def show_merge_summary(config: MergeConfig, first_total_pages: int, second_total_pages: int) -> None:
+    print("\n------------------------------------------------------------")
+    print("Review this summary before I start:")
+    print("------------------------------------------------------------")
+    print(f"First PDF               : {config.first_pdf_path}")
+    print(f"First PDF total pages   : {first_total_pages}")
+    print(f"Second PDF              : {config.second_pdf_path}")
+    print(f"Second PDF total pages  : {second_total_pages}")
+    print(f"Merged output file      : {config.output_path}")
+    print(f"Total merged pages      : {first_total_pages + second_total_pages}")
+
+
+def merge_pdf_files(config: MergeConfig) -> MergeResult:
+    pdf_reader, pdf_writer = load_pdf_tools()
+    first_reader = pdf_reader(str(config.first_pdf_path))
+    second_reader = pdf_reader(str(config.second_pdf_path))
+    writer = pdf_writer()
+
+    for reader in (first_reader, second_reader):
+        for page in reader.pages:
+            writer.add_page(page)
+
+    config.output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path = ensure_unique_path(config.output_path)
+    with output_path.open("wb") as handle:
+        writer.write(handle)
+
+    total_pages = len(first_reader.pages) + len(second_reader.pages)
+    return MergeResult(output_path=output_path, total_pages=total_pages)
 
 
 def load_pdf_tools() -> tuple[type, type]:
@@ -768,10 +1080,34 @@ def ensure_unique_directory_path(path: Path) -> Path:
         counter += 1
 
 
-def build_default_output_dir(pdf_path: Path, suffix: str) -> Path:
-    folder_name = sanitize_directory_name(suffix) or sanitize_directory_name(pdf_path.stem)
+def build_default_output_dir(pdf_path: Path, naming_template: str) -> Path:
+    folder_name = sanitize_directory_name(build_default_output_dir_label(naming_template))
+    folder_name = folder_name or sanitize_directory_name(pdf_path.stem)
     folder_name = folder_name or "output"
     return ensure_unique_directory_path(pdf_path.with_name(folder_name))
+
+
+def build_default_merge_output_dir(first_pdf_path: Path) -> Path:
+    return ensure_unique_directory_path(first_pdf_path.with_name("Merged PDF"))
+
+
+def build_merge_output_filename(first_pdf_path: Path) -> str:
+    base_name = sanitize_directory_name(first_pdf_path.stem) or "merged"
+    return f"{base_name}.pdf"
+
+
+def build_default_merge_output_path(first_pdf_path: Path) -> Path:
+    return ensure_unique_path(
+        build_default_merge_output_dir(first_pdf_path) / build_merge_output_filename(first_pdf_path)
+    )
+
+
+def normalize_merge_output_path(path: Path, default_filename: str) -> Path:
+    if path.exists() and path.is_dir():
+        return ensure_unique_path(path / default_filename)
+    if path.suffix.casefold() != ".pdf":
+        path = path.with_suffix(".pdf")
+    return ensure_unique_path(path)
 
 
 def sanitize_directory_name(name: str) -> str:
@@ -803,7 +1139,7 @@ def write_report(
         f"PDF path: {config.pdf_path}",
         f"Output dir: {config.output_dir}",
         f"Pages per file: {config.pages_per_file}",
-        f"Suffix: {config.suffix}",
+        f"Naming template: {config.naming_template}",
         f"Name column: {config.name_column}",
         f"Order column: {config.order_column or 'Original row order'}",
         "",
@@ -826,6 +1162,27 @@ def write_report(
     report_path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def write_merge_report(
+    config: MergeConfig,
+    first_total_pages: int,
+    second_total_pages: int,
+    result: MergeResult,
+) -> None:
+    report_path = result.output_path.parent / "merge_report.txt"
+    lines = [
+        "PDF EDITOR MERGE REPORT",
+        "",
+        f"First PDF path: {config.first_pdf_path}",
+        f"Second PDF path: {config.second_pdf_path}",
+        f"Output file: {result.output_path}",
+        "",
+        f"First PDF total pages: {first_total_pages}",
+        f"Second PDF total pages: {second_total_pages}",
+        f"Total merged pages: {result.total_pages}",
+    ]
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def show_completion(config: JobConfig, result: SplitResult) -> None:
     print("------------------------------------------------------------")
     print("Done")
@@ -840,3 +1197,13 @@ def show_completion(config: JobConfig, result: SplitResult) -> None:
         print("\nExample files:")
         for path in result.output_files[:3]:
             print(f"- {path.name}")
+
+
+def show_merge_completion(result: MergeResult) -> None:
+    print("------------------------------------------------------------")
+    print("Done")
+    print("------------------------------------------------------------")
+    print(f"Merged PDF file         : {result.output_path}")
+    print(f"Total merged pages      : {result.total_pages}")
+    print(f"Output folder           : {result.output_path.parent}")
+    print(f"Report file             : {result.output_path.parent / 'merge_report.txt'}")
