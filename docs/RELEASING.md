@@ -39,18 +39,20 @@ This creates:
 ## Suggested Release Text
 
 ```md
-# PDF EDITOR v0.2.0
+# PDF EDITOR v0.2.1
 
-PDF EDITOR is a macOS-focused tool for splitting PDFs from CSV/XLSX naming data and merging two PDFs into one output file.
+PDF EDITOR is a macOS-focused tool for splitting PDFs from CSV/XLSX naming data and merging PDFs in simple or batch workflows.
 
 ## Highlights
 
 - Split and Merge modes in one CLI
 - Custom split naming templates with `{Name}` placeholder
-- New Merge PDF workflow for combining two PDFs into one file
+- Simple Merge for combining two PDFs into one file
+- Batch Merge for looping every PDF in a split-output folder against one fixed PDF
 - Smart default output handling:
   - Split mode auto-creates output folders
-  - Merge mode auto-creates a `Merged PDF` folder when no output path is provided
+  - Simple Merge auto-creates a `Merged PDF` folder when no output path is provided
+  - Batch Merge auto-creates a `Batch Merged PDF` folder when no output folder is provided
   - Existing folders and filenames auto-increment with `(2)`, `(3)`, and so on
 - AI-friendly fast CLI mode with direct flags for split and merge
 - Generated report files for both workflows:
@@ -80,14 +82,27 @@ python3 -m pdf_editor \
   --output-dir "/path/to/output"
 ```
 
-Merge example:
+Simple merge example:
 
 ```bash
 python3 -m pdf_editor \
   --mode merge \
+  --merge-kind simple \
   --first-pdf-path "/path/to/first.pdf" \
   --second-pdf-path "/path/to/second.pdf" \
   --output-path "/path/to/merged.pdf"
+```
+
+Batch merge example:
+
+```bash
+python3 -m pdf_editor \
+  --mode merge \
+  --merge-kind batch \
+  --batch-input-dir "/path/to/split-output" \
+  --fixed-pdf-path "/path/to/fixed.pdf" \
+  --merge-order split-first \
+  --batch-output-dir "/path/to/batch-output"
 ```
 
 ## Notes

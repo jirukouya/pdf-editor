@@ -10,17 +10,21 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from pdf_editor.app import (
+    BatchMergeConfig,
     MergeConfig,
+    build_default_batch_merge_output_dir,
     build_default_output_dir,
     build_default_merge_output_path,
     build_default_merge_output_dir,
     build_default_output_dir_label,
     build_merge_output_filename,
     build_output_filename,
+    collect_batch_input_pdfs,
     contains_name_placeholder,
     ensure_unique_directory_path,
     ensure_unique_path,
     find_missing_dependencies,
+    merge_pdf_folder,
     merge_pdf_files,
     inspect_sheet,
     install_missing_dependencies,
@@ -234,6 +238,18 @@ class AppTests(unittest.TestCase):
         pdf_path = Path("/tmp/source.pdf")
         self.assertEqual(build_default_merge_output_dir(pdf_path).name, "Merged PDF")
 
+    def test_build_default_batch_merge_output_dir_uses_batch_name(self) -> None:
+        input_dir = Path("/tmp/Split Output")
+        self.assertEqual(build_default_batch_merge_output_dir(input_dir).name, "Batch Merged PDF")
+
+    def test_build_default_batch_merge_output_dir_adds_counter(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "Split Output"
+            input_dir.mkdir()
+            existing = Path(tmpdir) / "Batch Merged PDF"
+            existing.mkdir()
+            self.assertEqual(build_default_batch_merge_output_dir(input_dir).name, "Batch Merged PDF (2)")
+
     def test_build_default_merge_output_path_uses_first_pdf_name(self) -> None:
         pdf_path = Path("/tmp/Offer Letter.pdf")
         self.assertEqual(
@@ -244,6 +260,20 @@ class AppTests(unittest.TestCase):
     def test_build_merge_output_filename_follows_first_pdf_name(self) -> None:
         pdf_path = Path("/tmp/Offer Letter.pdf")
         self.assertEqual(build_merge_output_filename(pdf_path), "Offer Letter.pdf")
+
+    def test_collect_batch_input_pdfs_uses_top_level_sorted_pdf_files(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir)
+            (input_dir / "b.pdf").write_bytes(b"b")
+            (input_dir / "A.pdf").write_bytes(b"a")
+            (input_dir / "note.txt").write_text("x", encoding="utf-8")
+            nested = input_dir / "nested"
+            nested.mkdir()
+            (nested / "c.pdf").write_bytes(b"c")
+            self.assertEqual(
+                [path.name for path in collect_batch_input_pdfs(input_dir)],
+                ["A.pdf", "b.pdf"],
+            )
 
     def test_normalize_merge_output_path_uses_default_filename_for_directory(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -299,6 +329,124 @@ class AppTests(unittest.TestCase):
                 "first-page-1\nfirst-page-2\nsecond-page-1\nsecond-page-2",
             )
 
+    def test_merge_pdf_files_supports_fixed_first_order(self) -> None:
+        class FakeReader:
+            def __init__(self, path: str) -> None:
+                self.pages = [f"{Path(path).stem}-page-1"]
+
+        class FakeWriter:
+            def __init__(self) -> None:
+                self.pages: list[str] = []
+
+            def add_page(self, page: str) -> None:
+                self.pages.append(page)
+
+            def write(self, handle) -> None:
+                handle.write("\n".join(self.pages).encode("utf-8"))
+
+        with TemporaryDirectory() as tmpdir:
+            first_pdf = Path(tmpdir) / "first.pdf"
+            second_pdf = Path(tmpdir) / "second.pdf"
+            first_pdf.write_bytes(b"first")
+            second_pdf.write_bytes(b"second")
+            output_path = Path(tmpdir) / "merged.pdf"
+            config = MergeConfig(
+                first_pdf_path=first_pdf,
+                second_pdf_path=second_pdf,
+                output_path=output_path,
+                merge_order="fixed-first",
+            )
+
+            from unittest.mock import patch
+
+            with patch("pdf_editor.app.load_pdf_tools", return_value=(FakeReader, FakeWriter)):
+                result = merge_pdf_files(config)
+
+            self.assertEqual(result.total_pages, 2)
+            self.assertEqual(output_path.read_text(encoding="utf-8"), "second-page-1\nfirst-page-1")
+
+    def test_merge_pdf_folder_writes_batch_outputs(self) -> None:
+        class FakeReader:
+            def __init__(self, path: str) -> None:
+                self.pages = [f"{Path(path).stem}-page-1"]
+
+        class FakeWriter:
+            def __init__(self) -> None:
+                self.pages: list[str] = []
+
+            def add_page(self, page: str) -> None:
+                self.pages.append(page)
+
+            def write(self, handle) -> None:
+                handle.write("\n".join(self.pages).encode("utf-8"))
+
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            input_dir = base_dir / "Split Output"
+            input_dir.mkdir()
+            (input_dir / "b.pdf").write_bytes(b"b")
+            (input_dir / "A.pdf").write_bytes(b"a")
+            (input_dir / "skip.txt").write_text("x", encoding="utf-8")
+            fixed_pdf = base_dir / "fixed.pdf"
+            fixed_pdf.write_bytes(b"fixed")
+            output_dir = base_dir / "Batch Merged PDF"
+            config = BatchMergeConfig(
+                input_dir=input_dir,
+                fixed_pdf_path=fixed_pdf,
+                merge_order="split-first",
+                output_dir=output_dir,
+            )
+
+            from unittest.mock import patch
+
+            with patch("pdf_editor.app.load_pdf_tools", return_value=(FakeReader, FakeWriter)):
+                result = merge_pdf_folder(config)
+
+            self.assertEqual(result.written, 2)
+            self.assertEqual([path.name for path in result.output_files], ["A.pdf", "b.pdf"])
+            self.assertEqual((output_dir / "A.pdf").read_text(encoding="utf-8"), "A-page-1\nfixed-page-1")
+            self.assertEqual((output_dir / "b.pdf").read_text(encoding="utf-8"), "b-page-1\nfixed-page-1")
+
+    def test_merge_pdf_folder_renames_when_output_file_exists(self) -> None:
+        class FakeReader:
+            def __init__(self, path: str) -> None:
+                self.pages = [f"{Path(path).stem}-page-1"]
+
+        class FakeWriter:
+            def __init__(self) -> None:
+                self.pages: list[str] = []
+
+            def add_page(self, page: str) -> None:
+                self.pages.append(page)
+
+            def write(self, handle) -> None:
+                handle.write("\n".join(self.pages).encode("utf-8"))
+
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            input_dir = base_dir / "Split Output"
+            input_dir.mkdir()
+            (input_dir / "A.pdf").write_bytes(b"a")
+            fixed_pdf = base_dir / "fixed.pdf"
+            fixed_pdf.write_bytes(b"fixed")
+            output_dir = base_dir / "Batch Merged PDF"
+            output_dir.mkdir()
+            (output_dir / "A.pdf").write_text("existing", encoding="utf-8")
+            config = BatchMergeConfig(
+                input_dir=input_dir,
+                fixed_pdf_path=fixed_pdf,
+                merge_order="fixed-first",
+                output_dir=output_dir,
+            )
+
+            from unittest.mock import patch
+
+            with patch("pdf_editor.app.load_pdf_tools", return_value=(FakeReader, FakeWriter)):
+                result = merge_pdf_folder(config)
+
+            self.assertEqual([path.name for path in result.output_files], ["A (2).pdf"])
+            self.assertEqual((output_dir / "A (2).pdf").read_text(encoding="utf-8"), "fixed-page-1\nA-page-1")
+
     def test_validate_existing_file_path_rejects_missing_file(self) -> None:
         with self.assertRaises(SystemExit) as context:
             validate_existing_file_path(Path("/tmp/does-not-exist.pdf"), {".pdf"}, "PDF file")
@@ -320,9 +468,14 @@ class AppTests(unittest.TestCase):
             output_dir=None,
             name_column=None,
             order_column=None,
+            merge_kind="simple",
             first_pdf_path=None,
             second_pdf_path=None,
             output_path=None,
+            batch_input_dir=None,
+            fixed_pdf_path=None,
+            merge_order="split-first",
+            batch_output_dir=None,
         )
         from unittest.mock import patch
 
@@ -341,9 +494,14 @@ class AppTests(unittest.TestCase):
             output_dir=None,
             name_column=None,
             order_column=None,
+            merge_kind="simple",
             first_pdf_path=None,
             second_pdf_path=None,
             output_path=None,
+            batch_input_dir=None,
+            fixed_pdf_path=None,
+            merge_order="split-first",
+            batch_output_dir=None,
         )
         from unittest.mock import patch
 
@@ -351,6 +509,32 @@ class AppTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as context:
                 run_non_interactive(args)
         self.assertIn("--first-pdf-path and --second-pdf-path", str(context.exception))
+
+    def test_run_non_interactive_requires_batch_merge_inputs(self) -> None:
+        args = argparse.Namespace(
+            mode="merge",
+            sheet_path=None,
+            pdf_path=None,
+            pages_per_file=1,
+            naming_template="{Name}",
+            output_dir=None,
+            name_column=None,
+            order_column=None,
+            merge_kind="batch",
+            first_pdf_path=None,
+            second_pdf_path=None,
+            output_path=None,
+            batch_input_dir=None,
+            fixed_pdf_path=None,
+            merge_order="split-first",
+            batch_output_dir=None,
+        )
+        from unittest.mock import patch
+
+        with patch("pdf_editor.app.run_startup_checks"):
+            with self.assertRaises(SystemExit) as context:
+                run_non_interactive(args)
+        self.assertIn("--batch-input-dir and --fixed-pdf-path", str(context.exception))
 
     def test_parse_simulated_missing_deps(self) -> None:
         self.assertEqual(parse_simulated_missing_deps("pypdf, other "), ["pypdf", "other"])

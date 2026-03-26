@@ -1,13 +1,13 @@
 ---
 name: pdf-editor-cli
-description: Use when an AI needs to run PDF EDITOR from its repository to split a PDF using CSV or XLSX input or merge two PDFs via the interactive CLI, without using the .command launchers.
+description: Use when an AI needs to run PDF EDITOR from its repository to split a PDF using CSV or XLSX input or perform simple or batch PDF merge workflows via the CLI, without using the .command launchers.
 ---
 
 # PDF EDITOR CLI
 
 ## When to use this skill
 
-Use this skill when you need to operate PDF EDITOR directly from the repository to either split a merged PDF into smaller PDFs named from a CSV or XLSX sheet, or merge two PDFs into one output PDF.
+Use this skill when you need to operate PDF EDITOR directly from the repository to either split a merged PDF into smaller PDFs named from a CSV or XLSX sheet, run a simple two-file merge, or run a batch merge over a split-output folder with one fixed PDF.
 
 This skill is for the current interactive CLI only. It is not for MCP, APIs, or the macOS `.command` launchers.
 
@@ -20,11 +20,14 @@ This skill is for the current interactive CLI only. It is not for MCP, APIs, or 
 - Supported document input: `.pdf`
 - The CLI also supports a fast non-interactive mode through `--mode split` or `--mode merge`.
 - The CLI starts by asking whether to run `Split PDF` or `Merge PDF`.
+- Merge mode then asks whether to run `Simple Merge` or `Batch Merge`.
 - The CLI auto-detects a name column and may auto-detect an order column.
 - The CLI asks for a full naming template that must include `{Name}`.
 - If the output folder is left blank, the default folder name follows the fixed text in the naming template. If the template is name-only, it falls back to the source PDF stem.
 - Duplicate output filenames are auto-renamed automatically.
-- For merge mode, if the output path is blank, the CLI creates a `Merged PDF` folder and uses the first PDF filename by default.
+- For simple merge mode, if the output path is blank, the CLI creates a `Merged PDF` folder and uses the first PDF filename by default.
+- For batch merge mode, if the output folder is blank, the CLI creates a `Batch Merged PDF` folder.
+- For batch merge mode, the output files keep the split PDF filenames by default.
 - The CLI writes `split_report.txt` for split mode and `merge_report.txt` for merge mode.
 - Startup checks may attempt dependency recovery and may restart inside the local `.venv`.
 
@@ -71,17 +74,33 @@ Merge example:
 ```bash
 python3 -m pdf_editor \
   --mode merge \
+  --merge-kind simple \
   --first-pdf-path "/path/to/first.pdf" \
   --second-pdf-path "/path/to/second.pdf" \
   --output-path "/path/to/merged.pdf"
 ```
 
+Batch merge example:
+
+```bash
+python3 -m pdf_editor \
+  --mode merge \
+  --merge-kind batch \
+  --batch-input-dir "/path/to/split-output" \
+  --fixed-pdf-path "/path/to/fixed.pdf" \
+  --merge-order split-first \
+  --batch-output-dir "/path/to/batch-output"
+```
+
 Fast CLI notes:
 
 - Split mode requires `--sheet-path` and `--pdf-path`
-- Merge mode requires `--first-pdf-path` and `--second-pdf-path`
-- If `--output-path` is omitted in merge mode, the CLI creates a `Merged PDF` folder and uses the first PDF filename
-- If `--output-path` points to an existing folder in merge mode, the CLI uses the first PDF filename inside that folder
+- Simple merge mode requires `--first-pdf-path` and `--second-pdf-path`
+- Batch merge mode requires `--batch-input-dir` and `--fixed-pdf-path`
+- If `--output-path` is omitted in simple merge mode, the CLI creates a `Merged PDF` folder and uses the first PDF filename
+- If `--output-path` points to an existing folder in simple merge mode, the CLI uses the first PDF filename inside that folder
+- If `--batch-output-dir` is omitted in batch merge mode, the CLI creates a `Batch Merged PDF` folder
+- If `--merge-order` is used in batch merge mode, valid values are `split-first` and `fixed-first`
 - If `--name-column` or `--order-column` is provided in split mode, matching is case-insensitive and spacing-insensitive
 
 ## Interactive prompt sequence
@@ -106,10 +125,22 @@ Split flow:
 
 Merge flow:
 
+1. Choose `Simple Merge` or `Batch Merge`.
+
+Simple merge flow:
+
 1. Enter the first PDF path.
 2. Enter the second PDF path.
 3. Enter the output PDF path, or leave it blank for automatic output in `Merged PDF`.
 4. Review the summary and confirm yes/no before generation starts.
+
+Batch merge flow:
+
+1. Enter the split-output folder path.
+2. Enter the fixed PDF path.
+3. Choose the merge order: `split-first` or `fixed-first`.
+4. Enter the output folder path, or leave it blank for automatic output in `Batch Merged PDF`.
+5. Review the summary and confirm yes/no before generation starts.
 
 Short prompt-flow sketch:
 
@@ -136,12 +167,19 @@ After a successful split run, report:
 - the generated file count
 - any unused names or unwritten chunks shown by the CLI
 
-After a successful merge run, report:
+After a successful simple merge run, report:
 
 - the merged PDF path
 - the output folder path
 - the `merge_report.txt` path
 - the total merged pages
+
+After a successful batch merge run, report:
+
+- the output folder path
+- the `merge_report.txt` path
+- the generated file count
+- a few example output filenames if shown by the CLI
 
 If example output filenames are printed in split mode, you may relay a few of them to confirm naming.
 

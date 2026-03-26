@@ -93,12 +93,28 @@ class MergeConfig:
     first_pdf_path: Path
     second_pdf_path: Path
     output_path: Path
+    merge_order: str = "first-second"
 
 
 @dataclass
 class MergeResult:
     output_path: Path
     total_pages: int
+
+
+@dataclass
+class BatchMergeConfig:
+    input_dir: Path
+    fixed_pdf_path: Path
+    merge_order: str
+    output_dir: Path
+
+
+@dataclass
+class BatchMergeResult:
+    written: int
+    total_pages_per_file: int
+    output_files: list[Path]
 
 
 def main() -> None:
@@ -109,7 +125,7 @@ def main() -> None:
     parser.add_argument(
         "--version",
         action="version",
-        version="pdf-editor 0.2.0",
+        version="pdf-editor 0.2.1",
     )
     parser.add_argument(
         "--simulate-missing-deps",
@@ -137,9 +153,24 @@ def main() -> None:
     parser.add_argument("--output-dir", help="Output directory for split mode.")
     parser.add_argument("--name-column", help="Optional explicit name column for split mode.")
     parser.add_argument("--order-column", help="Optional explicit order column for split mode.")
+    parser.add_argument(
+        "--merge-kind",
+        choices=("simple", "batch"),
+        default="simple",
+        help="Merge workflow to run in merge mode.",
+    )
     parser.add_argument("--first-pdf-path", help="First PDF path for merge mode.")
     parser.add_argument("--second-pdf-path", help="Second PDF path for merge mode.")
     parser.add_argument("--output-path", help="Merged PDF output path for merge mode.")
+    parser.add_argument("--batch-input-dir", help="Input folder of split PDFs for batch merge mode.")
+    parser.add_argument("--fixed-pdf-path", help="Fixed PDF path for batch merge mode.")
+    parser.add_argument(
+        "--merge-order",
+        choices=("split-first", "fixed-first"),
+        default="split-first",
+        help="Page order for batch merge mode.",
+    )
+    parser.add_argument("--batch-output-dir", help="Output folder for batch merge mode.")
     args = parser.parse_args()
     simulated_missing = parse_simulated_missing_deps(args.simulate_missing_deps)
     try:
@@ -224,8 +255,11 @@ def run_split_non_interactive(args: argparse.Namespace) -> None:
 
 
 def run_merge_non_interactive(args: argparse.Namespace) -> None:
+    if args.merge_kind == "batch":
+        run_batch_merge_non_interactive(args)
+        return
     if not args.first_pdf_path or not args.second_pdf_path:
-        raise SystemExit("Merge mode requires --first-pdf-path and --second-pdf-path.")
+        raise SystemExit("Simple merge mode requires --first-pdf-path and --second-pdf-path.")
 
     first_pdf_path = validate_existing_file_path(
         Path(args.first_pdf_path).expanduser(),
@@ -249,11 +283,43 @@ def run_merge_non_interactive(args: argparse.Namespace) -> None:
         first_pdf_path=first_pdf_path,
         second_pdf_path=second_pdf_path,
         output_path=output_path,
+        merge_order="first-second",
     )
     show_merge_summary(config, first_total_pages, second_total_pages)
     result = merge_pdf_files(config)
     write_merge_report(config, first_total_pages, second_total_pages, result)
     show_merge_completion(result)
+
+
+def run_batch_merge_non_interactive(args: argparse.Namespace) -> None:
+    if not args.batch_input_dir or not args.fixed_pdf_path:
+        raise SystemExit("Batch merge mode requires --batch-input-dir and --fixed-pdf-path.")
+
+    input_dir = validate_existing_directory_path(
+        Path(args.batch_input_dir).expanduser(),
+        "batch input folder",
+    )
+    fixed_pdf_path = validate_existing_file_path(
+        Path(args.fixed_pdf_path).expanduser(),
+        {".pdf"},
+        "fixed PDF file",
+    )
+    ensure_batch_input_pdfs_exist(input_dir)
+    output_dir = (
+        Path(args.batch_output_dir).expanduser()
+        if args.batch_output_dir
+        else build_default_batch_merge_output_dir(input_dir)
+    )
+    config = BatchMergeConfig(
+        input_dir=input_dir,
+        fixed_pdf_path=fixed_pdf_path,
+        merge_order=args.merge_order,
+        output_dir=output_dir,
+    )
+    show_batch_merge_summary(config)
+    result = merge_pdf_folder(config)
+    write_batch_merge_report(config, result)
+    show_batch_merge_completion(config, result)
 
 
 def run_split_interactive() -> None:
@@ -356,6 +422,12 @@ def run_split_interactive() -> None:
 
 def run_merge_interactive() -> None:
     print("Selected function: Merge PDF\n")
+    merge_kind = prompt_merge_kind()
+    if merge_kind == "batch":
+        run_batch_merge_interactive()
+        return
+
+    print("Selected merge type: Simple Merge\n")
 
     first_pdf_path = prompt_existing_file(
         "[1/3] Where is your first PDF file?",
@@ -383,6 +455,7 @@ def run_merge_interactive() -> None:
         first_pdf_path=first_pdf_path,
         second_pdf_path=second_pdf_path,
         output_path=output_path,
+        merge_order="first-second",
     )
     show_merge_summary(config, first_total_pages, second_total_pages)
 
@@ -393,6 +466,46 @@ def run_merge_interactive() -> None:
     result = merge_pdf_files(config)
     write_merge_report(config, first_total_pages, second_total_pages, result)
     show_merge_completion(result)
+
+
+def run_batch_merge_interactive() -> None:
+    print("Selected merge type: Batch Merge\n")
+
+    input_dir = prompt_existing_directory(
+        "[1/4] Where is your split-output folder?",
+    )
+    input_pdfs = ensure_batch_input_pdfs_exist(input_dir)
+    print(f"Found {len(input_pdfs)} PDF file(s) in that folder.")
+
+    fixed_pdf_path = prompt_existing_file(
+        "\n[2/4] Where is the fixed PDF file?",
+        allowed_extensions={".pdf"},
+    )
+    fixed_total_pages = get_pdf_page_count(fixed_pdf_path)
+    print(f"Loaded fixed PDF. Total pages: {fixed_total_pages}")
+
+    merge_order = prompt_batch_merge_order()
+    output_dir = prompt_batch_merge_output_dir(
+        "\n[4/4] Where should I save the batch merged PDFs?\n"
+        "Leave blank and I will create a 'Batch Merged PDF' folder automatically.\n"
+        "> ",
+        input_dir,
+    )
+    config = BatchMergeConfig(
+        input_dir=input_dir,
+        fixed_pdf_path=fixed_pdf_path,
+        merge_order=merge_order,
+        output_dir=output_dir,
+    )
+    show_batch_merge_summary(config)
+
+    if not prompt_yes_no("\nDo you want to start batch merging now?", default=True):
+        print("Cancelled.")
+        return
+
+    result = merge_pdf_folder(config)
+    write_batch_merge_report(config, result)
+    show_batch_merge_completion(config, result)
 
 
 def run_startup_checks(
@@ -566,6 +679,21 @@ def prompt_operation() -> str:
         print("Please choose 1 for Split PDF or 2 for Merge PDF.")
 
 
+def prompt_merge_kind() -> str:
+    while True:
+        raw = input(
+            "Which merge function do you want to use?\n"
+            "1. Simple Merge\n"
+            "2. Batch Merge\n"
+            "> "
+        ).strip().lower()
+        if raw in {"1", "simple", "simple merge"}:
+            return "simple"
+        if raw in {"2", "batch", "batch merge"}:
+            return "batch"
+        print("Please choose 1 for Simple Merge or 2 for Batch Merge.")
+
+
 def prompt_positive_int(message: str, default: int) -> int:
     while True:
         raw = input(f"{message}\nDefault is {default}. Press Enter to use it.\n> ").strip()
@@ -632,6 +760,33 @@ def prompt_merge_output_path(message: str, first_pdf_path: Path) -> Path:
     return output_path
 
 
+def prompt_batch_merge_order() -> str:
+    while True:
+        raw = input(
+            "\n[3/4] Which merge order do you want?\n"
+            "1. Split PDF first, fixed PDF second\n"
+            "2. Fixed PDF first, split PDF second\n"
+            "> "
+        ).strip().lower()
+        if raw in {"1", "split-first", "split first"}:
+            return "split-first"
+        if raw in {"2", "fixed-first", "fixed first"}:
+            return "fixed-first"
+        print("Please choose 1 for split-first or 2 for fixed-first.")
+
+
+def prompt_batch_merge_output_dir(message: str, input_dir: Path) -> Path:
+    raw = input(message)
+    path = parse_path_input(raw)
+    if path:
+        return path
+    output_dir = build_default_batch_merge_output_dir(input_dir)
+    print("\nNo output folder was provided.")
+    print('Default folder name will be: "Batch Merged PDF"')
+    print(f"I will create this folder automatically:\n{output_dir}")
+    return output_dir
+
+
 def prompt_yes_no(message: str, default: bool) -> bool:
     suffix = "(Y/n)" if default else "(y/N)"
     while True:
@@ -678,6 +833,30 @@ def validate_existing_file_path(
         allowed = ", ".join(sorted(allowed_extensions))
         raise SystemExit(f"The {label} must use one of these extensions: {allowed}")
     return path
+
+
+def validate_existing_directory_path(path: Path, label: str = "folder") -> Path:
+    if not path.exists():
+        raise SystemExit(f"The {label} was not found: {path}")
+    if not path.is_dir():
+        raise SystemExit(f"The {label} is not a folder: {path}")
+    return path
+
+
+def prompt_existing_directory(message: str) -> Path:
+    while True:
+        raw = input(f"{message}\n> ")
+        path = parse_path_input(raw)
+        if not path:
+            print("Please enter a valid path.")
+            continue
+        if not path.exists():
+            print("That folder was not found. Please try again.")
+            continue
+        if not path.is_dir():
+            print("That path is not a folder. Please try again.")
+            continue
+        return path
 
 
 def parse_path_input(raw: str) -> Path | None:
@@ -1035,22 +1214,85 @@ def show_merge_summary(config: MergeConfig, first_total_pages: int, second_total
 
 
 def merge_pdf_files(config: MergeConfig) -> MergeResult:
+    total_pages = get_pdf_page_count(config.first_pdf_path) + get_pdf_page_count(config.second_pdf_path)
+    output_path = merge_two_pdf_paths(
+        config.first_pdf_path,
+        config.second_pdf_path,
+        config.output_path,
+        config.merge_order,
+    )
+    return MergeResult(output_path=output_path, total_pages=total_pages)
+
+
+def show_batch_merge_summary(config: BatchMergeConfig) -> None:
+    input_pdfs = ensure_batch_input_pdfs_exist(config.input_dir)
+    fixed_total_pages = get_pdf_page_count(config.fixed_pdf_path)
+    merged_pages = sum(get_pdf_page_count(path) + fixed_total_pages for path in input_pdfs)
+    print("\n------------------------------------------------------------")
+    print("Review this summary before I start:")
+    print("------------------------------------------------------------")
+    print(f"Batch input folder      : {config.input_dir}")
+    print(f"Found split PDF files   : {len(input_pdfs)}")
+    print(f"Fixed PDF               : {config.fixed_pdf_path}")
+    print(f"Fixed PDF total pages   : {fixed_total_pages}")
+    print(f"Merge order             : {config.merge_order}")
+    print(f"Batch output folder     : {config.output_dir}")
+    print(f"Expected output files   : {len(input_pdfs)}")
+    print(f"Expected merged pages   : {merged_pages}")
+
+
+def merge_pdf_folder(config: BatchMergeConfig) -> BatchMergeResult:
+    input_pdfs = ensure_batch_input_pdfs_exist(config.input_dir)
+
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    fixed_total_pages = get_pdf_page_count(config.fixed_pdf_path)
+    output_files: list[Path] = []
+
+    for index, split_pdf_path in enumerate(input_pdfs, start=1):
+        output_path = merge_two_pdf_paths(
+            split_pdf_path,
+            config.fixed_pdf_path,
+            config.output_dir / split_pdf_path.name,
+            config.merge_order,
+        )
+        output_files.append(output_path)
+        print_progress(index, len(input_pdfs))
+
+    print("")
+    total_pages_per_file = fixed_total_pages
+    if input_pdfs:
+        total_pages_per_file += get_pdf_page_count(input_pdfs[0])
+    return BatchMergeResult(
+        written=len(output_files),
+        total_pages_per_file=total_pages_per_file,
+        output_files=output_files,
+    )
+
+
+def merge_two_pdf_paths(
+    first_pdf_path: Path,
+    second_pdf_path: Path,
+    output_path: Path,
+    merge_order: str,
+) -> Path:
     pdf_reader, pdf_writer = load_pdf_tools()
-    first_reader = pdf_reader(str(config.first_pdf_path))
-    second_reader = pdf_reader(str(config.second_pdf_path))
+    first_reader = pdf_reader(str(first_pdf_path))
+    second_reader = pdf_reader(str(second_pdf_path))
     writer = pdf_writer()
 
-    for reader in (first_reader, second_reader):
+    readers = (first_reader, second_reader)
+    if merge_order == "fixed-first":
+        readers = (second_reader, first_reader)
+
+    for reader in readers:
         for page in reader.pages:
             writer.add_page(page)
 
-    config.output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path = ensure_unique_path(config.output_path)
-    with output_path.open("wb") as handle:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    unique_output_path = ensure_unique_path(output_path)
+    with unique_output_path.open("wb") as handle:
         writer.write(handle)
-
-    total_pages = len(first_reader.pages) + len(second_reader.pages)
-    return MergeResult(output_path=output_path, total_pages=total_pages)
+    return unique_output_path
 
 
 def load_pdf_tools() -> tuple[type, type]:
@@ -1100,6 +1342,28 @@ def build_default_merge_output_path(first_pdf_path: Path) -> Path:
     return ensure_unique_path(
         build_default_merge_output_dir(first_pdf_path) / build_merge_output_filename(first_pdf_path)
     )
+
+
+def build_default_batch_merge_output_dir(input_dir: Path) -> Path:
+    return ensure_unique_directory_path(input_dir.with_name("Batch Merged PDF"))
+
+
+def collect_batch_input_pdfs(input_dir: Path) -> list[Path]:
+    return sorted(
+        [
+            path
+            for path in input_dir.iterdir()
+            if path.is_file() and path.suffix.casefold() == ".pdf"
+        ],
+        key=lambda path: path.name.casefold(),
+    )
+
+
+def ensure_batch_input_pdfs_exist(input_dir: Path) -> list[Path]:
+    input_pdfs = collect_batch_input_pdfs(input_dir)
+    if not input_pdfs:
+        raise SystemExit("The batch input folder does not contain any PDF files.")
+    return input_pdfs
 
 
 def normalize_merge_output_path(path: Path, default_filename: str) -> Path:
@@ -1174,12 +1438,30 @@ def write_merge_report(
         "",
         f"First PDF path: {config.first_pdf_path}",
         f"Second PDF path: {config.second_pdf_path}",
+        f"Merge order: {config.merge_order}",
         f"Output file: {result.output_path}",
         "",
         f"First PDF total pages: {first_total_pages}",
         f"Second PDF total pages: {second_total_pages}",
         f"Total merged pages: {result.total_pages}",
     ]
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def write_batch_merge_report(config: BatchMergeConfig, result: BatchMergeResult) -> None:
+    report_path = config.output_dir / "merge_report.txt"
+    lines = [
+        "PDF EDITOR BATCH MERGE REPORT",
+        "",
+        f"Batch input folder: {config.input_dir}",
+        f"Fixed PDF path: {config.fixed_pdf_path}",
+        f"Merge order: {config.merge_order}",
+        f"Output folder: {config.output_dir}",
+        f"Written files: {result.written}",
+        "",
+        "Output files:",
+    ]
+    lines.extend(f"- {path.name}" for path in result.output_files)
     report_path.write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -1207,3 +1489,17 @@ def show_merge_completion(result: MergeResult) -> None:
     print(f"Total merged pages      : {result.total_pages}")
     print(f"Output folder           : {result.output_path.parent}")
     print(f"Report file             : {result.output_path.parent / 'merge_report.txt'}")
+
+
+def show_batch_merge_completion(config: BatchMergeConfig, result: BatchMergeResult) -> None:
+    print("------------------------------------------------------------")
+    print("Done")
+    print("------------------------------------------------------------")
+    print(f"Generated PDF files     : {result.written}")
+    print(f"Output folder           : {config.output_dir}")
+    print(f"Report file             : {config.output_dir / 'merge_report.txt'}")
+
+    if result.output_files:
+        print("\nExample files:")
+        for path in result.output_files[:3]:
+            print(f"- {path.name}")

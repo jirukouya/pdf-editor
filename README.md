@@ -1,6 +1,6 @@
 # PDF EDITOR
 
-PDF EDITOR is a macOS-focused tool for splitting PDFs from CSV/XLSX naming data and merging two PDFs into one output file.
+PDF EDITOR is a macOS-focused tool for splitting PDFs from CSV/XLSX naming data and merging PDFs in either simple or batch workflows.
 
 It supports both:
 
@@ -15,7 +15,8 @@ It supports both:
 - automatic name column detection
 - optional order column detection
 - custom naming template input with `{Name}` placeholder
-- merge two PDFs into one output file
+- simple merge for combining two PDFs into one output file
+- batch merge for looping a split-output folder against one fixed PDF
 - automatic output folder creation
 - duplicate filename auto-renaming
 - text report generation
@@ -71,9 +72,17 @@ When you choose `Split PDF`:
 
 When you choose `Merge PDF`:
 
-1. first PDF path
-2. second PDF path
-3. output PDF path, or blank for automatic folder creation in `Merged PDF`
+Choose either:
+
+- `Simple Merge`
+  1. first PDF path
+  2. second PDF path
+  3. output PDF path, or blank for automatic folder creation in `Merged PDF`
+- `Batch Merge`
+  1. split-output folder path
+  2. fixed PDF path
+  3. merge order: split-first or fixed-first
+  4. output folder path, or blank for automatic folder creation in `Batch Merged PDF`
 
 Then it will:
 
@@ -110,17 +119,32 @@ Merge example:
 ```bash
 python3 -m pdf_editor \
   --mode merge \
+  --merge-kind simple \
   --first-pdf-path "/path/to/first.pdf" \
   --second-pdf-path "/path/to/second.pdf" \
   --output-path "/path/to/merged.pdf"
+```
+
+Batch merge example:
+
+```bash
+python3 -m pdf_editor \
+  --mode merge \
+  --merge-kind batch \
+  --batch-input-dir "/path/to/split-output" \
+  --fixed-pdf-path "/path/to/fixed.pdf" \
+  --merge-order split-first \
+  --batch-output-dir "/path/to/batch-output"
 ```
 
 Fast CLI defaults:
 
 - Split mode defaults `--pages-per-file` to `1`
 - Split mode defaults `--naming-template` to `{Name}`
-- Merge mode creates a `Merged PDF` folder automatically if `--output-path` is omitted
-- Merge mode uses the first PDF filename automatically if `--output-path` points to a folder or is omitted
+- Simple merge creates a `Merged PDF` folder automatically if `--output-path` is omitted
+- Simple merge uses the first PDF filename automatically if `--output-path` points to a folder or is omitted
+- Batch merge creates a `Batch Merged PDF` folder automatically if `--batch-output-dir` is omitted
+- Batch merge keeps each split PDF filename by default and only adds `(2)` when needed
 
 ## Optional Editable Install
 
