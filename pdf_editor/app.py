@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import importlib
+import json
 import os
 import re
 import shlex
@@ -60,6 +61,8 @@ ORDER_CANDIDATES = [
     "staff id",
 ]
 NAME_PLACEHOLDER_PATTERN = re.compile(r"\{\s*name\s*\}", re.IGNORECASE)
+OUTPUT_EXISTS_POLICIES = {"fail", "overwrite", "rename", "continue"}
+DUPLICATE_NAME_POLICIES = {"autorename", "fail", "append-row-number", "append-order"}
 
 
 @dataclass
@@ -78,6 +81,8 @@ class JobConfig:
     output_dir: Path
     name_column: str
     order_column: str | None
+    output_exists_policy: str = "rename"
+    duplicate_name_policy: str = "autorename"
 
 
 @dataclass
@@ -86,6 +91,9 @@ class SplitResult:
     skipped_names: int
     skipped_chunks: int
     output_files: list[Path]
+    overwritten_files: list[Path]
+    renamed_files: list[Path]
+    skipped_existing_files: list[Path]
 
 
 @dataclass
@@ -94,12 +102,16 @@ class MergeConfig:
     second_pdf_path: Path
     output_path: Path
     merge_order: str = "first-second"
+    output_exists_policy: str = "rename"
 
 
 @dataclass
 class MergeResult:
     output_path: Path
     total_pages: int
+    overwritten_files: list[Path]
+    renamed_files: list[Path]
+    skipped_existing_files: list[Path]
 
 
 @dataclass
@@ -108,6 +120,7 @@ class BatchMergeConfig:
     fixed_pdf_path: Path
     merge_order: str
     output_dir: Path
+    output_exists_policy: str = "rename"
 
 
 @dataclass
@@ -115,6 +128,38 @@ class BatchMergeResult:
     written: int
     total_pages_per_file: int
     output_files: list[Path]
+    overwritten_files: list[Path]
+    renamed_files: list[Path]
+    skipped_existing_files: list[Path]
+
+
+@dataclass
+class PlannedSplitOutput:
+    record: InputRecord
+    requested_filename: str
+    final_path: Path
+    action: str
+
+
+@dataclass
+class PlannedBatchOutput:
+    input_pdf_path: Path
+    final_path: Path
+    action: str
+
+
+@dataclass
+class FastCliPreflight:
+    status: str
+    phase: str
+    mode: str
+    merge_kind: str | None
+    can_proceed: bool
+    requires_confirmation: bool
+    warnings: list[str]
+    errors: list[str]
+    summary: dict[str, object]
+    result: dict[str, object] | None = None
 
 
 def main() -> None:
@@ -171,11 +216,48 @@ def main() -> None:
         help="Page order for batch merge mode.",
     )
     parser.add_argument("--batch-output-dir", help="Output folder for batch merge mode.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate inputs and warnings without writing output files.",
+    )
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Alias for --dry-run.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit a single JSON object to stdout for fast CLI runs.",
+    )
+    parser.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Allow execution to proceed when fast CLI preflight returns warnings.",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Treat fast CLI warnings as errors and stop execution.",
+    )
+    parser.add_argument(
+        "--on-output-exists",
+        choices=tuple(sorted(OUTPUT_EXISTS_POLICIES)),
+        default="fail",
+        help="Conflict policy for explicit fast-CLI outputs.",
+    )
+    parser.add_argument(
+        "--duplicate-name-policy",
+        choices=tuple(sorted(DUPLICATE_NAME_POLICIES)),
+        default="autorename",
+        help="Duplicate rendered filename policy for fast split mode.",
+    )
     args = parser.parse_args()
     simulated_missing = parse_simulated_missing_deps(args.simulate_missing_deps)
     try:
         if args.mode:
-            run_non_interactive(args, simulated_missing)
+            raise SystemExit(run_non_interactive(args, simulated_missing))
         else:
             run_interactive(simulated_missing)
     except KeyboardInterrupt:
@@ -196,130 +278,42 @@ def run_interactive(simulated_missing: list[str] | None = None) -> None:
     run_split_interactive()
 
 
-def run_non_interactive(args: argparse.Namespace, simulated_missing: list[str] | None = None) -> None:
-    run_startup_checks(simulated_missing, interactive=False)
-    if args.mode == "split":
-        run_split_non_interactive(args)
-        return
-    run_merge_non_interactive(args)
+def run_non_interactive(args: argparse.Namespace, simulated_missing: list[str] | None = None) -> int:
+    args.dry_run = args.dry_run or args.validate_only
+    try:
+        run_startup_checks(
+            simulated_missing,
+            interactive=False,
+            verbose=not args.json,
+        )
+        preflight, context = build_fast_cli_preflight(args)
+    except SystemExit as exc:
+        return emit_fast_cli_error(args, str(exc) or "Unknown error")
 
+    if preflight.status == "error":
+        return emit_fast_cli_result(args, preflight, exit_code=1)
+    if preflight.status == "warning":
+        if args.strict:
+            preflight = FastCliPreflight(
+                status="error",
+                phase="validate",
+                mode=preflight.mode,
+                merge_kind=preflight.merge_kind,
+                can_proceed=False,
+                requires_confirmation=False,
+                warnings=preflight.warnings,
+                errors=["Warnings were treated as errors because --strict was provided."],
+                summary=preflight.summary,
+            )
+            return emit_fast_cli_result(args, preflight, exit_code=1)
+        if args.dry_run or not args.confirm:
+            return emit_fast_cli_result(args, preflight, exit_code=2)
 
-def run_split_non_interactive(args: argparse.Namespace) -> None:
-    if not args.sheet_path or not args.pdf_path:
-        raise SystemExit("Split mode requires --sheet-path and --pdf-path.")
-    if args.pages_per_file <= 0:
-        raise SystemExit("--pages-per-file must be greater than 0.")
+    if args.dry_run:
+        return emit_fast_cli_result(args, preflight, exit_code=0)
 
-    sheet_path = validate_existing_file_path(
-        Path(args.sheet_path).expanduser(),
-        SUPPORTED_SHEET_EXTENSIONS,
-        "sheet file",
-    )
-    pdf_path = validate_existing_file_path(
-        Path(args.pdf_path).expanduser(),
-        {".pdf"},
-        "PDF file",
-    )
-    naming_template = sanitize_naming_template(args.naming_template or "{Name}")
-    if not contains_name_placeholder(naming_template):
-        raise SystemExit("The naming template must include {Name}.")
-
-    fieldnames = inspect_sheet(sheet_path)
-    name_column = resolve_requested_column_name(fieldnames, args.name_column, "name")
-    order_column = resolve_requested_column_name(fieldnames, args.order_column, "order")
-    _, records, detected_name_column, detected_order_column = read_sheet_records(
-        sheet_path,
-        forced_name_column=name_column,
-        forced_order_column=order_column,
-    )
-    total_pages = get_pdf_page_count(pdf_path)
-    output_dir = (
-        Path(args.output_dir).expanduser()
-        if args.output_dir
-        else build_default_output_dir(pdf_path, naming_template)
-    )
-    config = JobConfig(
-        sheet_path=sheet_path,
-        pdf_path=pdf_path,
-        pages_per_file=args.pages_per_file,
-        naming_template=naming_template,
-        output_dir=output_dir,
-        name_column=detected_name_column,
-        order_column=detected_order_column,
-    )
-    warnings = build_warnings(records, total_pages, args.pages_per_file)
-    show_summary(config, total_pages, len(records), warnings)
-    result = split_pdf_named(config, records, total_pages)
-    write_report(config, total_pages, len(records), warnings, result)
-    show_completion(config, result)
-
-
-def run_merge_non_interactive(args: argparse.Namespace) -> None:
-    if args.merge_kind == "batch":
-        run_batch_merge_non_interactive(args)
-        return
-    if not args.first_pdf_path or not args.second_pdf_path:
-        raise SystemExit("Simple merge mode requires --first-pdf-path and --second-pdf-path.")
-
-    first_pdf_path = validate_existing_file_path(
-        Path(args.first_pdf_path).expanduser(),
-        {".pdf"},
-        "first PDF file",
-    )
-    second_pdf_path = validate_existing_file_path(
-        Path(args.second_pdf_path).expanduser(),
-        {".pdf"},
-        "second PDF file",
-    )
-    output_path = (
-        build_default_merge_output_path(first_pdf_path)
-        if not args.output_path
-        else normalize_merge_output_path(Path(args.output_path).expanduser(), build_merge_output_filename(first_pdf_path))
-    )
-
-    first_total_pages = get_pdf_page_count(first_pdf_path)
-    second_total_pages = get_pdf_page_count(second_pdf_path)
-    config = MergeConfig(
-        first_pdf_path=first_pdf_path,
-        second_pdf_path=second_pdf_path,
-        output_path=output_path,
-        merge_order="first-second",
-    )
-    show_merge_summary(config, first_total_pages, second_total_pages)
-    result = merge_pdf_files(config)
-    write_merge_report(config, first_total_pages, second_total_pages, result)
-    show_merge_completion(result)
-
-
-def run_batch_merge_non_interactive(args: argparse.Namespace) -> None:
-    if not args.batch_input_dir or not args.fixed_pdf_path:
-        raise SystemExit("Batch merge mode requires --batch-input-dir and --fixed-pdf-path.")
-
-    input_dir = validate_existing_directory_path(
-        Path(args.batch_input_dir).expanduser(),
-        "batch input folder",
-    )
-    fixed_pdf_path = validate_existing_file_path(
-        Path(args.fixed_pdf_path).expanduser(),
-        {".pdf"},
-        "fixed PDF file",
-    )
-    ensure_batch_input_pdfs_exist(input_dir)
-    output_dir = (
-        Path(args.batch_output_dir).expanduser()
-        if args.batch_output_dir
-        else build_default_batch_merge_output_dir(input_dir)
-    )
-    config = BatchMergeConfig(
-        input_dir=input_dir,
-        fixed_pdf_path=fixed_pdf_path,
-        merge_order=args.merge_order,
-        output_dir=output_dir,
-    )
-    show_batch_merge_summary(config)
-    result = merge_pdf_folder(config)
-    write_batch_merge_report(config, result)
-    show_batch_merge_completion(config, result)
+    executed = execute_fast_cli_context(context, preflight)
+    return emit_fast_cli_result(args, executed, exit_code=0)
 
 
 def run_split_interactive() -> None:
@@ -508,20 +502,571 @@ def run_batch_merge_interactive() -> None:
     show_batch_merge_completion(config, result)
 
 
+def build_fast_cli_preflight(
+    args: argparse.Namespace,
+) -> tuple[FastCliPreflight, dict[str, object] | None]:
+    if args.mode == "split":
+        return build_split_fast_cli_preflight(args)
+    if args.merge_kind == "batch":
+        return build_batch_merge_fast_cli_preflight(args)
+    return build_simple_merge_fast_cli_preflight(args)
+
+
+def build_split_fast_cli_preflight(
+    args: argparse.Namespace,
+) -> tuple[FastCliPreflight, dict[str, object] | None]:
+    try:
+        if not args.sheet_path or not args.pdf_path:
+            raise SystemExit("Split mode requires --sheet-path and --pdf-path.")
+        if args.pages_per_file <= 0:
+            raise SystemExit("--pages-per-file must be greater than 0.")
+
+        sheet_path = validate_existing_file_path(
+            Path(args.sheet_path).expanduser(),
+            SUPPORTED_SHEET_EXTENSIONS,
+            "sheet file",
+        )
+        pdf_path = validate_existing_file_path(
+            Path(args.pdf_path).expanduser(),
+            {".pdf"},
+            "PDF file",
+        )
+        naming_template = sanitize_naming_template(args.naming_template or "{Name}")
+        if not contains_name_placeholder(naming_template):
+            raise SystemExit("The naming template must include {Name}.")
+        output_exists_policy = validate_choice(
+            args.on_output_exists,
+            OUTPUT_EXISTS_POLICIES,
+            "--on-output-exists",
+        )
+        duplicate_name_policy = validate_choice(
+            args.duplicate_name_policy,
+            DUPLICATE_NAME_POLICIES,
+            "--duplicate-name-policy",
+        )
+
+        fieldnames = inspect_sheet(sheet_path)
+        name_column = resolve_requested_column_name(fieldnames, args.name_column, "name")
+        order_column = resolve_requested_column_name(fieldnames, args.order_column, "order")
+        _, records, detected_name_column, detected_order_column = read_sheet_records(
+            sheet_path,
+            forced_name_column=name_column,
+            forced_order_column=order_column,
+        )
+        total_pages = get_pdf_page_count(pdf_path)
+        output_dir = (
+            Path(args.output_dir).expanduser()
+            if args.output_dir
+            else build_default_output_dir(pdf_path, naming_template)
+        )
+
+        warnings = build_warnings(records, total_pages, args.pages_per_file)
+        errors: list[str] = []
+        if args.output_dir and is_non_empty_directory(output_dir) and output_exists_policy == "fail":
+            errors.append(f"Output directory already exists and is not empty: {output_dir}")
+
+        config = JobConfig(
+            sheet_path=sheet_path,
+            pdf_path=pdf_path,
+            pages_per_file=args.pages_per_file,
+            naming_template=naming_template,
+            output_dir=output_dir,
+            name_column=detected_name_column,
+            order_column=detected_order_column,
+            output_exists_policy=output_exists_policy,
+            duplicate_name_policy=duplicate_name_policy,
+        )
+        split_plan, duplicate_names, duplicate_rendered_filenames = plan_split_outputs(
+            records,
+            total_pages,
+            config,
+        )
+        if duplicate_rendered_filenames and duplicate_name_policy == "fail":
+            errors.append(
+                "Duplicate rendered filenames were found: "
+                + ", ".join(duplicate_rendered_filenames[:5])
+            )
+
+        status = "error" if errors else "warning" if warnings else "ok"
+        preflight = FastCliPreflight(
+            status=status,
+            phase="validate",
+            mode="split",
+            merge_kind=None,
+            can_proceed=not warnings and not errors,
+            requires_confirmation=bool(warnings) and not errors,
+            warnings=warnings,
+            errors=errors,
+            summary={
+                "pdf_total_pages": total_pages,
+                "sheet_record_count": len(records),
+                "expected_output_files": min(
+                    len(records),
+                    (total_pages + args.pages_per_file - 1) // args.pages_per_file,
+                ),
+                "name_column": detected_name_column,
+                "order_column": detected_order_column,
+                "output_dir": str(output_dir),
+                "duplicate_names": duplicate_names,
+                "duplicate_rendered_filenames": duplicate_rendered_filenames,
+                "duplicate_name_policy": duplicate_name_policy,
+                "output_exists_policy": output_exists_policy,
+                "planned_output_files": [str(entry.final_path) for entry in split_plan],
+            },
+        )
+        context = {
+            "kind": "split",
+            "config": config,
+            "records": records,
+            "total_pages": total_pages,
+            "warnings": warnings,
+            "split_plan": split_plan,
+        }
+        return preflight, context
+    except SystemExit as exc:
+        return (
+            FastCliPreflight(
+                status="error",
+                phase="validate",
+                mode="split",
+                merge_kind=None,
+                can_proceed=False,
+                requires_confirmation=False,
+                warnings=[],
+                errors=[str(exc)],
+                summary={},
+            ),
+            None,
+        )
+    except Exception as exc:
+        return build_preflight_exception("split", None, "Failed to inspect split inputs", exc)
+
+
+def build_simple_merge_fast_cli_preflight(
+    args: argparse.Namespace,
+) -> tuple[FastCliPreflight, dict[str, object] | None]:
+    try:
+        if not args.first_pdf_path or not args.second_pdf_path:
+            raise SystemExit("Simple merge mode requires --first-pdf-path and --second-pdf-path.")
+
+        first_pdf_path = validate_existing_file_path(
+            Path(args.first_pdf_path).expanduser(),
+            {".pdf"},
+            "first PDF file",
+        )
+        second_pdf_path = validate_existing_file_path(
+            Path(args.second_pdf_path).expanduser(),
+            {".pdf"},
+            "second PDF file",
+        )
+        output_exists_policy = validate_choice(
+            args.on_output_exists,
+            OUTPUT_EXISTS_POLICIES,
+            "--on-output-exists",
+        )
+        output_path = (
+            build_default_merge_output_path(first_pdf_path)
+            if not args.output_path
+            else normalize_merge_output_path(
+                Path(args.output_path).expanduser(),
+                build_merge_output_filename(first_pdf_path),
+            )
+        )
+        explicit_output_conflict = False
+        if args.output_path:
+            requested_output = Path(args.output_path).expanduser()
+            explicit_output_conflict = detect_simple_merge_output_conflict(
+                requested_output,
+                build_merge_output_filename(first_pdf_path),
+            )
+
+        warnings: list[str] = []
+        errors: list[str] = []
+        if explicit_output_conflict and output_exists_policy == "fail":
+            errors.append(f"Output file already exists: {output_path}")
+
+        first_total_pages = get_pdf_page_count(first_pdf_path)
+        second_total_pages = get_pdf_page_count(second_pdf_path)
+        final_output_path, planned_action = resolve_output_target(output_path, output_exists_policy, set())
+        preflight = FastCliPreflight(
+            status="error" if errors else "warning" if warnings else "ok",
+            phase="validate",
+            mode="merge",
+            merge_kind="simple",
+            can_proceed=not warnings and not errors,
+            requires_confirmation=bool(warnings) and not errors,
+            warnings=warnings,
+            errors=errors,
+            summary={
+                "first_pdf_pages": first_total_pages,
+                "second_pdf_pages": second_total_pages,
+                "output_path": str(final_output_path),
+                "output_conflict": explicit_output_conflict,
+                "output_exists_policy": output_exists_policy,
+                "planned_output_file": str(final_output_path),
+                "planned_action": planned_action,
+            },
+        )
+        context = {
+            "kind": "merge-simple",
+            "config": MergeConfig(
+                first_pdf_path=first_pdf_path,
+                second_pdf_path=second_pdf_path,
+                output_path=final_output_path,
+                merge_order="first-second",
+                output_exists_policy=output_exists_policy,
+            ),
+            "first_total_pages": first_total_pages,
+            "second_total_pages": second_total_pages,
+            "planned_action": planned_action,
+        }
+        return preflight, context
+    except SystemExit as exc:
+        return (
+            FastCliPreflight(
+                status="error",
+                phase="validate",
+                mode="merge",
+                merge_kind="simple",
+                can_proceed=False,
+                requires_confirmation=False,
+                warnings=[],
+                errors=[str(exc)],
+                summary={},
+            ),
+            None,
+        )
+    except Exception as exc:
+        return build_preflight_exception("merge", "simple", "Failed to inspect merge inputs", exc)
+
+
+def build_batch_merge_fast_cli_preflight(
+    args: argparse.Namespace,
+) -> tuple[FastCliPreflight, dict[str, object] | None]:
+    try:
+        if not args.batch_input_dir or not args.fixed_pdf_path:
+            raise SystemExit("Batch merge mode requires --batch-input-dir and --fixed-pdf-path.")
+
+        input_dir = validate_existing_directory_path(
+            Path(args.batch_input_dir).expanduser(),
+            "batch input folder",
+        )
+        fixed_pdf_path = validate_existing_file_path(
+            Path(args.fixed_pdf_path).expanduser(),
+            {".pdf"},
+            "fixed PDF file",
+        )
+        output_exists_policy = validate_choice(
+            args.on_output_exists,
+            OUTPUT_EXISTS_POLICIES,
+            "--on-output-exists",
+        )
+        input_pdfs = ensure_batch_input_pdfs_exist(input_dir)
+        output_dir = (
+            Path(args.batch_output_dir).expanduser()
+            if args.batch_output_dir
+            else build_default_batch_merge_output_dir(input_dir)
+        )
+        output_dir_conflict = bool(args.batch_output_dir and is_non_empty_directory(output_dir))
+        warnings: list[str] = []
+        errors: list[str] = []
+        if output_dir_conflict and output_exists_policy == "fail":
+            errors.append(f"Output directory already exists and is not empty: {output_dir}")
+
+        fixed_pdf_pages = get_pdf_page_count(fixed_pdf_path)
+        config = BatchMergeConfig(
+            input_dir=input_dir,
+            fixed_pdf_path=fixed_pdf_path,
+            merge_order=args.merge_order,
+            output_dir=output_dir,
+            output_exists_policy=output_exists_policy,
+        )
+        batch_plan = plan_batch_outputs(config)
+        preflight = FastCliPreflight(
+            status="error" if errors else "warning" if warnings else "ok",
+            phase="validate",
+            mode="merge",
+            merge_kind="batch",
+            can_proceed=not warnings and not errors,
+            requires_confirmation=bool(warnings) and not errors,
+            warnings=warnings,
+            errors=errors,
+            summary={
+                "input_dir": str(input_dir),
+                "input_pdf_count": len(input_pdfs),
+                "fixed_pdf_pages": fixed_pdf_pages,
+                "merge_order": args.merge_order,
+                "output_dir": str(output_dir),
+                "output_dir_conflict": output_dir_conflict,
+                "output_exists_policy": output_exists_policy,
+                "planned_output_files": [str(entry.final_path) for entry in batch_plan],
+            },
+        )
+        context = {
+            "kind": "merge-batch",
+            "config": config,
+            "batch_plan": batch_plan,
+        }
+        return preflight, context
+    except SystemExit as exc:
+        return (
+            FastCliPreflight(
+                status="error",
+                phase="validate",
+                mode="merge",
+                merge_kind="batch",
+                can_proceed=False,
+                requires_confirmation=False,
+                warnings=[],
+                errors=[str(exc)],
+                summary={},
+            ),
+            None,
+        )
+    except Exception as exc:
+        return build_preflight_exception("merge", "batch", "Failed to inspect batch merge inputs", exc)
+
+
+def execute_fast_cli_context(
+    context: dict[str, object] | None,
+    preflight: FastCliPreflight,
+) -> FastCliPreflight:
+    if not context:
+        return preflight
+
+    if context["kind"] == "split":
+        config = context["config"]
+        records = context["records"]
+        total_pages = context["total_pages"]
+        warnings = context["warnings"]
+        split_plan = context["split_plan"]
+        assert isinstance(config, JobConfig)
+        assert isinstance(records, list)
+        assert isinstance(total_pages, int)
+        assert isinstance(warnings, list)
+        assert isinstance(split_plan, list)
+        result = split_pdf_named(
+            config,
+            records,
+            total_pages,
+            show_progress_bar=False,
+            split_plan=split_plan,
+        )
+        write_report(config, total_pages, len(records), warnings, result)
+        return FastCliPreflight(
+            status="ok",
+            phase="execute",
+            mode="split",
+            merge_kind=None,
+            can_proceed=True,
+            requires_confirmation=False,
+            warnings=preflight.warnings,
+            errors=[],
+            summary=preflight.summary,
+            result={
+                "written_files": result.written,
+                "output_files": [str(path) for path in result.output_files],
+                "overwritten_files": [str(path) for path in result.overwritten_files],
+                "renamed_files": [str(path) for path in result.renamed_files],
+                "skipped_existing_files": [str(path) for path in result.skipped_existing_files],
+                "skipped_names": result.skipped_names,
+                "unwritten_chunks": result.skipped_chunks,
+                "report_path": str(config.output_dir / "split_report.txt"),
+            },
+        )
+
+    if context["kind"] == "merge-simple":
+        config = context["config"]
+        first_total_pages = context["first_total_pages"]
+        second_total_pages = context["second_total_pages"]
+        planned_action = context["planned_action"]
+        assert isinstance(config, MergeConfig)
+        assert isinstance(first_total_pages, int)
+        assert isinstance(second_total_pages, int)
+        assert isinstance(planned_action, str)
+        result = merge_pdf_files(config)
+        write_merge_report(config, first_total_pages, second_total_pages, result)
+        return FastCliPreflight(
+            status="ok",
+            phase="execute",
+            mode="merge",
+            merge_kind="simple",
+            can_proceed=True,
+            requires_confirmation=False,
+            warnings=preflight.warnings,
+            errors=[],
+            summary=preflight.summary,
+            result={
+                "output_file": str(result.output_path),
+                "total_pages": result.total_pages,
+                "overwritten_files": [
+                    str(path)
+                    for path in (
+                        result.overwritten_files
+                        or ([result.output_path] if planned_action == "overwrite" else [])
+                    )
+                ],
+                "renamed_files": [
+                    str(path)
+                    for path in (
+                        result.renamed_files
+                        or ([result.output_path] if planned_action == "rename" else [])
+                    )
+                ],
+                "skipped_existing_files": [str(path) for path in result.skipped_existing_files],
+                "report_path": str(result.output_path.parent / "merge_report.txt"),
+            },
+        )
+
+    config = context["config"]
+    batch_plan = context["batch_plan"]
+    assert isinstance(config, BatchMergeConfig)
+    assert isinstance(batch_plan, list)
+    result = merge_pdf_folder(config, show_progress_bar=False, batch_plan=batch_plan)
+    write_batch_merge_report(config, result)
+    return FastCliPreflight(
+        status="ok",
+        phase="execute",
+        mode="merge",
+        merge_kind="batch",
+        can_proceed=True,
+        requires_confirmation=False,
+        warnings=preflight.warnings,
+        errors=[],
+        summary=preflight.summary,
+        result={
+            "written_files": result.written,
+            "output_files": [str(path) for path in result.output_files],
+            "overwritten_files": [str(path) for path in result.overwritten_files],
+            "renamed_files": [str(path) for path in result.renamed_files],
+            "skipped_existing_files": [str(path) for path in result.skipped_existing_files],
+            "report_path": str(config.output_dir / "merge_report.txt"),
+        },
+    )
+
+
+def build_preflight_exception(
+    mode: str,
+    merge_kind: str | None,
+    message: str,
+    exc: Exception,
+) -> tuple[FastCliPreflight, None]:
+    return (
+        FastCliPreflight(
+            status="error",
+            phase="validate",
+            mode=mode,
+            merge_kind=merge_kind,
+            can_proceed=False,
+            requires_confirmation=False,
+            warnings=[],
+            errors=[f"{message}: {exc}"],
+            summary={},
+        ),
+        None,
+    )
+
+
+def emit_fast_cli_error(args: argparse.Namespace, message: str) -> int:
+    preflight = FastCliPreflight(
+        status="error",
+        phase="validate",
+        mode=args.mode or "unknown",
+        merge_kind=args.merge_kind if args.mode == "merge" else None,
+        can_proceed=False,
+        requires_confirmation=False,
+        warnings=[],
+        errors=[message],
+        summary={},
+    )
+    return emit_fast_cli_result(args, preflight, exit_code=1)
+
+
+def emit_fast_cli_result(
+    args: argparse.Namespace,
+    preflight: FastCliPreflight,
+    exit_code: int,
+) -> int:
+    if args.json:
+        payload = fast_cli_preflight_to_dict(preflight)
+        print(json.dumps(payload, ensure_ascii=True))
+        return exit_code
+
+    stream = sys.stderr if preflight.status != "ok" else sys.stdout
+    print(render_fast_cli_preflight(preflight), file=stream)
+    return exit_code
+
+
+def fast_cli_preflight_to_dict(preflight: FastCliPreflight) -> dict[str, object]:
+    return {
+        "status": preflight.status,
+        "phase": preflight.phase,
+        "mode": preflight.mode,
+        "merge_kind": preflight.merge_kind,
+        "can_proceed": preflight.can_proceed,
+        "requires_confirmation": preflight.requires_confirmation,
+        "warnings": preflight.warnings,
+        "errors": preflight.errors,
+        "summary": preflight.summary,
+        "result": preflight.result,
+    }
+
+
+def render_fast_cli_preflight(preflight: FastCliPreflight) -> str:
+    lines = [
+        "------------------------------------------------------------",
+        "Fast CLI Summary",
+        "------------------------------------------------------------",
+        f"Phase                   : {preflight.phase}",
+        f"Status                  : {preflight.status}",
+        f"Mode                    : {preflight.mode}",
+    ]
+    if preflight.merge_kind:
+        lines.append(f"Merge kind              : {preflight.merge_kind}")
+    for key, value in preflight.summary.items():
+        label = key.replace("_", " ").title()
+        lines.append(f"{label:<24}: {value}")
+    if preflight.warnings:
+        lines.append("")
+        lines.append("Warnings:")
+        lines.extend(f"- {warning}" for warning in preflight.warnings)
+    if preflight.errors:
+        lines.append("")
+        lines.append("Errors:")
+        lines.extend(f"- {error}" for error in preflight.errors)
+    if preflight.requires_confirmation:
+        lines.append("")
+        lines.append("Execution is blocked until you rerun with --confirm.")
+    if preflight.phase == "execute" and preflight.result:
+        lines.append("")
+        lines.append("Result:")
+        for key, value in preflight.result.items():
+            label = key.replace("_", " ").title()
+            lines.append(f"{label:<24}: {value}")
+    return "\n".join(lines)
+
+
 def run_startup_checks(
     simulated_missing: list[str] | None = None,
     interactive: bool = True,
+    verbose: bool = True,
 ) -> None:
     missing = find_missing_dependencies(simulated_missing=simulated_missing)
     if missing:
-        print("Startup check found a missing required library:")
-        for module_name in missing:
-            print(f"- {module_name}")
+        if verbose:
+            print("Startup check found a missing required library:")
+            for module_name in missing:
+                print(f"- {module_name}")
 
         if not interactive:
-            print("\nPlease run 'Setup PDF Editor.command' or install manually with:")
-            print(f"{sys.executable} -m pip install {' '.join(missing)}")
-            raise SystemExit(1)
+            message = (
+                "Required dependency is missing. Run 'Setup PDF Editor.command' or install manually with: "
+                f"{sys.executable} -m pip install {' '.join(missing)}"
+            )
+            if verbose:
+                print("\nPlease run 'Setup PDF Editor.command' or install manually with:")
+                print(f"{sys.executable} -m pip install {' '.join(missing)}")
+            raise SystemExit(message)
 
         if prompt_yes_no("\nDo you want me to install it now?", default=True):
             if install_missing_dependencies(missing):
@@ -546,7 +1091,8 @@ def run_startup_checks(
         print(f"{sys.executable} -m pip install {' '.join(missing)}")
         raise SystemExit(1)
 
-    print("Startup check passed. Required libraries are installed.\n")
+    if verbose:
+        print("Startup check passed. Required libraries are installed.\n")
 
 
 def find_missing_dependencies(
@@ -1076,6 +1622,13 @@ def get_pdf_page_count(pdf_path: Path) -> int:
     return len(reader.pages)
 
 
+def validate_choice(value: str, allowed: set[str], label: str) -> str:
+    if value not in allowed:
+        allowed_values = ", ".join(sorted(allowed))
+        raise SystemExit(f"{label} must be one of: {allowed_values}")
+    return value
+
+
 def build_output_filename(name: str, naming_template: str) -> str:
     rendered = render_naming_template(name, naming_template)
     return f"{sanitize_filename(rendered)}.pdf"
@@ -1117,6 +1670,31 @@ def build_default_output_dir_label(naming_template: str) -> str:
     return value
 
 
+def append_marker_to_filename(filename: str, marker: str) -> str:
+    path = Path(filename)
+    return f"{sanitize_filename(f'{path.stem} [{marker}]')}{path.suffix}"
+
+
+def find_duplicate_names(records: list[InputRecord]) -> list[str]:
+    return sorted(name for name, count in Counter(record.name for record in records).items() if count > 1)
+
+
+def find_duplicate_rendered_filenames(filenames: list[str]) -> list[str]:
+    return sorted(name for name, count in Counter(filenames).items() if count > 1)
+
+
+def is_non_empty_directory(path: Path) -> bool:
+    return path.exists() and path.is_dir() and any(path.iterdir())
+
+
+def detect_simple_merge_output_conflict(requested_output: Path, default_filename: str) -> bool:
+    if requested_output.exists() and requested_output.is_dir():
+        return (requested_output / default_filename).exists()
+    if requested_output.suffix.casefold() != ".pdf":
+        requested_output = requested_output.with_suffix(".pdf")
+    return requested_output.exists()
+
+
 def build_warnings(records: list[InputRecord], total_pages: int, pages_per_file: int) -> list[str]:
     warnings: list[str] = []
     chunk_count = (total_pages + pages_per_file - 1) // pages_per_file
@@ -1124,18 +1702,110 @@ def build_warnings(records: list[InputRecord], total_pages: int, pages_per_file:
         warnings.append(
             f"Sheet record count ({len(records)}) does not match PDF chunk count ({chunk_count})."
         )
-
-    duplicate_names = [
-        name for name, count in Counter(record.name for record in records).items() if count > 1
-    ]
-    if duplicate_names:
-        preview = ", ".join(sorted(duplicate_names)[:5])
-        if len(duplicate_names) > 5:
-            preview += " ..."
-        warnings.append(
-            "Duplicate names were found. Output files will be auto-renamed: " + preview
-        )
     return warnings
+
+
+def build_unique_candidate(path: Path, reserved_paths: set[Path]) -> Path:
+    if path not in reserved_paths and not path.exists():
+        return path
+    counter = 2
+    while True:
+        candidate = path.with_name(f"{path.stem} ({counter}){path.suffix}")
+        if candidate not in reserved_paths and not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def resolve_output_target(
+    requested_path: Path,
+    output_exists_policy: str,
+    reserved_paths: set[Path],
+) -> tuple[Path, str]:
+    if requested_path in reserved_paths:
+        return build_unique_candidate(requested_path, reserved_paths), "rename"
+    if not requested_path.exists():
+        return requested_path, "write"
+    if output_exists_policy == "overwrite":
+        return requested_path, "overwrite"
+    if output_exists_policy in {"rename", "continue"}:
+        return build_unique_candidate(requested_path, reserved_paths), "rename"
+    return requested_path, "skip"
+
+
+def plan_split_outputs(
+    records: list[InputRecord],
+    total_pages: int,
+    config: JobConfig,
+) -> tuple[list[PlannedSplitOutput], list[str], list[str]]:
+    chunk_count = (total_pages + config.pages_per_file - 1) // config.pages_per_file
+    limit = min(len(records), chunk_count)
+    planned_records = records[:limit]
+    base_filenames = [build_output_filename(record.name, config.naming_template) for record in planned_records]
+    duplicate_rendered_filenames = find_duplicate_rendered_filenames(base_filenames)
+    duplicate_name_lookup = set(duplicate_rendered_filenames)
+    duplicate_names = sorted(
+        {
+            record.name
+            for record, filename in zip(planned_records, base_filenames, strict=False)
+            if filename in duplicate_name_lookup
+        }
+    )
+
+    requested_filenames: list[str] = []
+    for record, filename in zip(planned_records, base_filenames, strict=False):
+        requested_filename = filename
+        if filename in duplicate_name_lookup:
+            if config.duplicate_name_policy == "append-row-number":
+                requested_filename = append_marker_to_filename(filename, f"row-{record.index}")
+            elif config.duplicate_name_policy == "append-order":
+                marker = (
+                    f"order-{record.order}"
+                    if config.order_column
+                    else f"row-{record.index}"
+                )
+                requested_filename = append_marker_to_filename(filename, marker)
+        requested_filenames.append(requested_filename)
+
+    reserved_paths: set[Path] = set()
+    plan: list[PlannedSplitOutput] = []
+    for record, requested_filename in zip(planned_records, requested_filenames, strict=False):
+        requested_path = config.output_dir / requested_filename
+        final_path, action = resolve_output_target(
+            requested_path,
+            config.output_exists_policy,
+            reserved_paths,
+        )
+        reserved_paths.add(final_path)
+        plan.append(
+            PlannedSplitOutput(
+                record=record,
+                requested_filename=requested_filename,
+                final_path=final_path,
+                action=action,
+            )
+        )
+    return plan, duplicate_names, duplicate_rendered_filenames
+
+
+def plan_batch_outputs(config: BatchMergeConfig) -> list[PlannedBatchOutput]:
+    reserved_paths: set[Path] = set()
+    plan: list[PlannedBatchOutput] = []
+    for input_pdf_path in collect_batch_input_pdfs(config.input_dir):
+        requested_path = config.output_dir / input_pdf_path.name
+        final_path, action = resolve_output_target(
+            requested_path,
+            config.output_exists_policy,
+            reserved_paths,
+        )
+        reserved_paths.add(final_path)
+        plan.append(
+            PlannedBatchOutput(
+                input_pdf_path=input_pdf_path,
+                final_path=final_path,
+                action=action,
+            )
+        )
+    return plan
 
 
 def show_summary(
@@ -1168,7 +1838,13 @@ def show_summary(
         print("- No obvious issues found")
 
 
-def split_pdf_named(config: JobConfig, records: list[InputRecord], total_pages: int) -> SplitResult:
+def split_pdf_named(
+    config: JobConfig,
+    records: list[InputRecord],
+    total_pages: int,
+    show_progress_bar: bool = True,
+    split_plan: list[PlannedSplitOutput] | None = None,
+) -> SplitResult:
     pdf_reader, pdf_writer = load_pdf_tools()
     reader = pdf_reader(str(config.pdf_path))
     config.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1176,6 +1852,10 @@ def split_pdf_named(config: JobConfig, records: list[InputRecord], total_pages: 
     chunk_count = (total_pages + config.pages_per_file - 1) // config.pages_per_file
     limit = min(len(records), chunk_count)
     output_files: list[Path] = []
+    overwritten_files: list[Path] = []
+    renamed_files: list[Path] = []
+    skipped_existing_files: list[Path] = []
+    plan = split_plan or plan_split_outputs(records, total_pages, config)[0]
 
     for idx in range(limit):
         start = idx * config.pages_per_file
@@ -1185,19 +1865,30 @@ def split_pdf_named(config: JobConfig, records: list[InputRecord], total_pages: 
         for page_number in range(start, end):
             writer.add_page(reader.pages[page_number])
 
-        base_name = build_output_filename(records[idx].name, config.naming_template)
-        output_path = ensure_unique_path(config.output_dir / base_name)
+        planned = plan[idx]
+        output_path = planned.final_path
         with output_path.open("wb") as handle:
             writer.write(handle)
         output_files.append(output_path)
-        print_progress(idx + 1, limit)
+        if planned.action == "overwrite":
+            overwritten_files.append(output_path)
+        elif planned.action == "rename":
+            renamed_files.append(output_path)
+        elif planned.action == "skip":
+            skipped_existing_files.append(output_path)
+        if show_progress_bar:
+            print_progress(idx + 1, limit)
 
-    print("")
+    if show_progress_bar:
+        print("")
     return SplitResult(
         written=limit,
         skipped_names=max(0, len(records) - limit),
         skipped_chunks=max(0, chunk_count - limit),
         output_files=output_files,
+        overwritten_files=overwritten_files,
+        renamed_files=renamed_files,
+        skipped_existing_files=skipped_existing_files,
     )
 
 
@@ -1215,13 +1906,20 @@ def show_merge_summary(config: MergeConfig, first_total_pages: int, second_total
 
 def merge_pdf_files(config: MergeConfig) -> MergeResult:
     total_pages = get_pdf_page_count(config.first_pdf_path) + get_pdf_page_count(config.second_pdf_path)
+    output_path, action = resolve_output_target(config.output_path, config.output_exists_policy, set())
     output_path = merge_two_pdf_paths(
         config.first_pdf_path,
         config.second_pdf_path,
-        config.output_path,
+        output_path,
         config.merge_order,
     )
-    return MergeResult(output_path=output_path, total_pages=total_pages)
+    return MergeResult(
+        output_path=output_path,
+        total_pages=total_pages,
+        overwritten_files=[output_path] if action == "overwrite" else [],
+        renamed_files=[output_path] if action == "rename" else [],
+        skipped_existing_files=[],
+    )
 
 
 def show_batch_merge_summary(config: BatchMergeConfig) -> None:
@@ -1241,24 +1939,39 @@ def show_batch_merge_summary(config: BatchMergeConfig) -> None:
     print(f"Expected merged pages   : {merged_pages}")
 
 
-def merge_pdf_folder(config: BatchMergeConfig) -> BatchMergeResult:
+def merge_pdf_folder(
+    config: BatchMergeConfig,
+    show_progress_bar: bool = True,
+    batch_plan: list[PlannedBatchOutput] | None = None,
+) -> BatchMergeResult:
     input_pdfs = ensure_batch_input_pdfs_exist(config.input_dir)
-
     config.output_dir.mkdir(parents=True, exist_ok=True)
     fixed_total_pages = get_pdf_page_count(config.fixed_pdf_path)
     output_files: list[Path] = []
+    overwritten_files: list[Path] = []
+    renamed_files: list[Path] = []
+    skipped_existing_files: list[Path] = []
+    plan = batch_plan or plan_batch_outputs(config)
 
-    for index, split_pdf_path in enumerate(input_pdfs, start=1):
+    for index, planned in enumerate(plan, start=1):
         output_path = merge_two_pdf_paths(
-            split_pdf_path,
+            planned.input_pdf_path,
             config.fixed_pdf_path,
-            config.output_dir / split_pdf_path.name,
+            planned.final_path,
             config.merge_order,
         )
         output_files.append(output_path)
-        print_progress(index, len(input_pdfs))
+        if planned.action == "overwrite":
+            overwritten_files.append(output_path)
+        elif planned.action == "rename":
+            renamed_files.append(output_path)
+        elif planned.action == "skip":
+            skipped_existing_files.append(output_path)
+        if show_progress_bar:
+            print_progress(index, len(plan))
 
-    print("")
+    if show_progress_bar:
+        print("")
     total_pages_per_file = fixed_total_pages
     if input_pdfs:
         total_pages_per_file += get_pdf_page_count(input_pdfs[0])
@@ -1266,6 +1979,9 @@ def merge_pdf_folder(config: BatchMergeConfig) -> BatchMergeResult:
         written=len(output_files),
         total_pages_per_file=total_pages_per_file,
         output_files=output_files,
+        overwritten_files=overwritten_files,
+        renamed_files=renamed_files,
+        skipped_existing_files=skipped_existing_files,
     )
 
 
@@ -1289,10 +2005,9 @@ def merge_two_pdf_paths(
             writer.add_page(page)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    unique_output_path = ensure_unique_path(output_path)
-    with unique_output_path.open("wb") as handle:
+    with output_path.open("wb") as handle:
         writer.write(handle)
-    return unique_output_path
+    return output_path
 
 
 def load_pdf_tools() -> tuple[type, type]:
@@ -1339,9 +2054,7 @@ def build_merge_output_filename(first_pdf_path: Path) -> str:
 
 
 def build_default_merge_output_path(first_pdf_path: Path) -> Path:
-    return ensure_unique_path(
-        build_default_merge_output_dir(first_pdf_path) / build_merge_output_filename(first_pdf_path)
-    )
+    return build_default_merge_output_dir(first_pdf_path) / build_merge_output_filename(first_pdf_path)
 
 
 def build_default_batch_merge_output_dir(input_dir: Path) -> Path:
@@ -1368,10 +2081,10 @@ def ensure_batch_input_pdfs_exist(input_dir: Path) -> list[Path]:
 
 def normalize_merge_output_path(path: Path, default_filename: str) -> Path:
     if path.exists() and path.is_dir():
-        return ensure_unique_path(path / default_filename)
+        return path / default_filename
     if path.suffix.casefold() != ".pdf":
         path = path.with_suffix(".pdf")
-    return ensure_unique_path(path)
+    return path
 
 
 def sanitize_directory_name(name: str) -> str:

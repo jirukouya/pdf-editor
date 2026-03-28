@@ -1,6 +1,10 @@
 import argparse
+import csv
+import io
+import json
 import sys
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from zipfile import ZipFile
@@ -118,6 +122,43 @@ def create_minimal_xlsx(path: Path) -> None:
 </worksheet>
 """,
         )
+
+
+def create_csv(path: Path, rows: list[dict[str, str]], fieldnames: list[str]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def make_args(**overrides: object) -> argparse.Namespace:
+    defaults: dict[str, object] = {
+        "mode": "split",
+        "sheet_path": None,
+        "pdf_path": None,
+        "pages_per_file": 1,
+        "naming_template": "{Name}",
+        "output_dir": None,
+        "name_column": None,
+        "order_column": None,
+        "merge_kind": "simple",
+        "first_pdf_path": None,
+        "second_pdf_path": None,
+        "output_path": None,
+        "batch_input_dir": None,
+        "fixed_pdf_path": None,
+        "merge_order": "split-first",
+        "batch_output_dir": None,
+        "dry_run": False,
+        "validate_only": False,
+        "json": False,
+        "confirm": False,
+        "strict": False,
+        "on_output_exists": "fail",
+        "duplicate_name_policy": "autorename",
+    }
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
 
 
 class AppTests(unittest.TestCase):
@@ -459,82 +500,598 @@ class AppTests(unittest.TestCase):
         )
 
     def test_run_non_interactive_requires_split_inputs(self) -> None:
-        args = argparse.Namespace(
-            mode="split",
-            sheet_path=None,
-            pdf_path=None,
-            pages_per_file=1,
-            naming_template="{Name}",
-            output_dir=None,
-            name_column=None,
-            order_column=None,
-            merge_kind="simple",
-            first_pdf_path=None,
-            second_pdf_path=None,
-            output_path=None,
-            batch_input_dir=None,
-            fixed_pdf_path=None,
-            merge_order="split-first",
-            batch_output_dir=None,
-        )
         from unittest.mock import patch
 
+        args = make_args(mode="split")
+        stdout = io.StringIO()
+        stderr = io.StringIO()
         with patch("pdf_editor.app.run_startup_checks"):
-            with self.assertRaises(SystemExit) as context:
-                run_non_interactive(args)
-        self.assertIn("--sheet-path and --pdf-path", str(context.exception))
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = run_non_interactive(args)
+        self.assertEqual(exit_code, 1)
+        self.assertIn("--sheet-path and --pdf-path", stderr.getvalue())
 
     def test_run_non_interactive_requires_merge_inputs(self) -> None:
-        args = argparse.Namespace(
-            mode="merge",
-            sheet_path=None,
-            pdf_path=None,
-            pages_per_file=1,
-            naming_template="{Name}",
-            output_dir=None,
-            name_column=None,
-            order_column=None,
-            merge_kind="simple",
-            first_pdf_path=None,
-            second_pdf_path=None,
-            output_path=None,
-            batch_input_dir=None,
-            fixed_pdf_path=None,
-            merge_order="split-first",
-            batch_output_dir=None,
-        )
         from unittest.mock import patch
 
+        args = make_args(mode="merge", merge_kind="simple")
+        stdout = io.StringIO()
+        stderr = io.StringIO()
         with patch("pdf_editor.app.run_startup_checks"):
-            with self.assertRaises(SystemExit) as context:
-                run_non_interactive(args)
-        self.assertIn("--first-pdf-path and --second-pdf-path", str(context.exception))
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = run_non_interactive(args)
+        self.assertEqual(exit_code, 1)
+        self.assertIn("--first-pdf-path and --second-pdf-path", stderr.getvalue())
 
     def test_run_non_interactive_requires_batch_merge_inputs(self) -> None:
-        args = argparse.Namespace(
-            mode="merge",
-            sheet_path=None,
-            pdf_path=None,
-            pages_per_file=1,
-            naming_template="{Name}",
-            output_dir=None,
-            name_column=None,
-            order_column=None,
-            merge_kind="batch",
-            first_pdf_path=None,
-            second_pdf_path=None,
-            output_path=None,
-            batch_input_dir=None,
-            fixed_pdf_path=None,
-            merge_order="split-first",
-            batch_output_dir=None,
-        )
         from unittest.mock import patch
 
+        args = make_args(mode="merge", merge_kind="batch")
+        stdout = io.StringIO()
+        stderr = io.StringIO()
         with patch("pdf_editor.app.run_startup_checks"):
-            with self.assertRaises(SystemExit) as context:
-                run_non_interactive(args)
-        self.assertIn("--batch-input-dir and --fixed-pdf-path", str(context.exception))
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = run_non_interactive(args)
+        self.assertEqual(exit_code, 1)
+        self.assertIn("--batch-input-dir and --fixed-pdf-path", stderr.getvalue())
+
+    def test_split_dry_run_warning_returns_exit_2_and_json(self) -> None:
+        from unittest.mock import patch
+
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            sheet_path = base_dir / "employees.xlsx"
+            create_minimal_xlsx(sheet_path)
+            pdf_path = base_dir / "source.pdf"
+            pdf_path.write_bytes(b"pdf")
+            args = make_args(
+                mode="split",
+                sheet_path=str(sheet_path),
+                pdf_path=str(pdf_path),
+                pages_per_file=3,
+                dry_run=True,
+                json=True,
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with patch("pdf_editor.app.run_startup_checks"), patch(
+                "pdf_editor.app.get_pdf_page_count", return_value=7
+            ):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = run_non_interactive(args)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(exit_code, 2)
+            self.assertEqual(payload["status"], "warning")
+            self.assertEqual(payload["phase"], "validate")
+            self.assertTrue(payload["requires_confirmation"])
+            self.assertEqual(stderr.getvalue(), "")
+
+    def test_split_dry_run_invalid_template_returns_exit_1(self) -> None:
+        from unittest.mock import patch
+
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            sheet_path = base_dir / "employees.xlsx"
+            create_minimal_xlsx(sheet_path)
+            pdf_path = base_dir / "source.pdf"
+            pdf_path.write_bytes(b"pdf")
+            args = make_args(
+                mode="split",
+                sheet_path=str(sheet_path),
+                pdf_path=str(pdf_path),
+                naming_template="No placeholder",
+                dry_run=True,
+                json=True,
+            )
+            stdout = io.StringIO()
+            with patch("pdf_editor.app.run_startup_checks"):
+                with redirect_stdout(stdout):
+                    exit_code = run_non_interactive(args)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(payload["status"], "error")
+
+    def test_split_validate_only_alias_behaves_like_dry_run(self) -> None:
+        from unittest.mock import patch
+
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            sheet_path = base_dir / "employees.xlsx"
+            create_minimal_xlsx(sheet_path)
+            pdf_path = base_dir / "source.pdf"
+            pdf_path.write_bytes(b"pdf")
+            args = make_args(
+                mode="split",
+                sheet_path=str(sheet_path),
+                pdf_path=str(pdf_path),
+                validate_only=True,
+                json=True,
+            )
+            stdout = io.StringIO()
+            with patch("pdf_editor.app.run_startup_checks"), patch(
+                "pdf_editor.app.get_pdf_page_count", return_value=2
+            ):
+                with redirect_stdout(stdout):
+                    exit_code = run_non_interactive(args)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(payload["status"], "ok")
+            self.assertEqual(payload["phase"], "validate")
+            self.assertIsNone(payload["result"])
+
+    def test_split_warning_requires_confirm_before_execute(self) -> None:
+        from unittest.mock import patch
+
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            sheet_path = base_dir / "employees.xlsx"
+            create_minimal_xlsx(sheet_path)
+            pdf_path = base_dir / "source.pdf"
+            pdf_path.write_bytes(b"pdf")
+            args = make_args(
+                mode="split",
+                sheet_path=str(sheet_path),
+                pdf_path=str(pdf_path),
+                pages_per_file=3,
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with patch("pdf_editor.app.run_startup_checks"), patch(
+                "pdf_editor.app.get_pdf_page_count", return_value=7
+            ), patch("pdf_editor.app.split_pdf_named") as split_mock:
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = run_non_interactive(args)
+            self.assertEqual(exit_code, 2)
+            split_mock.assert_not_called()
+            self.assertIn("--confirm", stderr.getvalue())
+
+    def test_split_warning_with_confirm_executes(self) -> None:
+        from unittest.mock import patch
+
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            sheet_path = base_dir / "employees.xlsx"
+            create_minimal_xlsx(sheet_path)
+            pdf_path = base_dir / "source.pdf"
+            pdf_path.write_bytes(b"pdf")
+            output_dir = base_dir / "out"
+            args = make_args(
+                mode="split",
+                sheet_path=str(sheet_path),
+                pdf_path=str(pdf_path),
+                output_dir=str(output_dir),
+                pages_per_file=3,
+                confirm=True,
+                json=True,
+            )
+            fake_result = type(
+                "SplitResultStub",
+                (),
+                {
+                    "written": 2,
+                    "skipped_names": 0,
+                    "skipped_chunks": 0,
+                    "output_files": [output_dir / "Alice Tan.pdf", output_dir / "Bob Lee.pdf"],
+                    "overwritten_files": [],
+                    "renamed_files": [],
+                    "skipped_existing_files": [],
+                },
+            )()
+            stdout = io.StringIO()
+            with patch("pdf_editor.app.run_startup_checks"), patch(
+                "pdf_editor.app.get_pdf_page_count", return_value=7
+            ), patch("pdf_editor.app.split_pdf_named", return_value=fake_result) as split_mock, patch(
+                "pdf_editor.app.write_report"
+            ):
+                with redirect_stdout(stdout):
+                    exit_code = run_non_interactive(args)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(payload["phase"], "execute")
+            self.assertEqual(payload["status"], "ok")
+            split_mock.assert_called_once()
+
+    def test_split_warning_with_strict_fails(self) -> None:
+        from unittest.mock import patch
+
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            sheet_path = base_dir / "employees.xlsx"
+            create_minimal_xlsx(sheet_path)
+            pdf_path = base_dir / "source.pdf"
+            pdf_path.write_bytes(b"pdf")
+            args = make_args(
+                mode="split",
+                sheet_path=str(sheet_path),
+                pdf_path=str(pdf_path),
+                pages_per_file=3,
+                strict=True,
+                json=True,
+            )
+            stdout = io.StringIO()
+            with patch("pdf_editor.app.run_startup_checks"), patch(
+                "pdf_editor.app.get_pdf_page_count", return_value=7
+            ), patch("pdf_editor.app.split_pdf_named") as split_mock:
+                with redirect_stdout(stdout):
+                    exit_code = run_non_interactive(args)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(payload["status"], "error")
+            split_mock.assert_not_called()
+
+    def test_split_duplicate_rendered_names_fail_policy_returns_error(self) -> None:
+        from unittest.mock import patch
+
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            sheet_path = base_dir / "employees.csv"
+            create_csv(
+                sheet_path,
+                [{"NAME": "Alex"}, {"NAME": "Alex"}],
+                ["NAME"],
+            )
+            pdf_path = base_dir / "source.pdf"
+            pdf_path.write_bytes(b"pdf")
+            args = make_args(
+                mode="split",
+                sheet_path=str(sheet_path),
+                pdf_path=str(pdf_path),
+                duplicate_name_policy="fail",
+                dry_run=True,
+                json=True,
+            )
+            stdout = io.StringIO()
+            with patch("pdf_editor.app.run_startup_checks"), patch(
+                "pdf_editor.app.get_pdf_page_count", return_value=2
+            ):
+                with redirect_stdout(stdout):
+                    exit_code = run_non_interactive(args)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(payload["status"], "error")
+            self.assertEqual(payload["summary"]["duplicate_rendered_filenames"], ["Alex.pdf"])
+
+    def test_split_append_row_number_plans_deterministic_output_files(self) -> None:
+        from unittest.mock import patch
+
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            sheet_path = base_dir / "employees.csv"
+            create_csv(
+                sheet_path,
+                [{"NAME": "Alex"}, {"NAME": "Alex"}],
+                ["NAME"],
+            )
+            pdf_path = base_dir / "source.pdf"
+            pdf_path.write_bytes(b"pdf")
+            args = make_args(
+                mode="split",
+                sheet_path=str(sheet_path),
+                pdf_path=str(pdf_path),
+                duplicate_name_policy="append-row-number",
+                dry_run=True,
+                json=True,
+            )
+            stdout = io.StringIO()
+            with patch("pdf_editor.app.run_startup_checks"), patch(
+                "pdf_editor.app.get_pdf_page_count", return_value=2
+            ):
+                with redirect_stdout(stdout):
+                    exit_code = run_non_interactive(args)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(
+                [Path(path).name for path in payload["summary"]["planned_output_files"]],
+                ["Alex [row-1].pdf", "Alex [row-2].pdf"],
+            )
+
+    def test_split_append_order_uses_order_column_in_planned_output_files(self) -> None:
+        from unittest.mock import patch
+
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            sheet_path = base_dir / "employees.csv"
+            create_csv(
+                sheet_path,
+                [{"NO": "8", "NAME": "Alex"}, {"NO": "9", "NAME": "Alex"}],
+                ["NO", "NAME"],
+            )
+            pdf_path = base_dir / "source.pdf"
+            pdf_path.write_bytes(b"pdf")
+            args = make_args(
+                mode="split",
+                sheet_path=str(sheet_path),
+                pdf_path=str(pdf_path),
+                duplicate_name_policy="append-order",
+                dry_run=True,
+                json=True,
+            )
+            stdout = io.StringIO()
+            with patch("pdf_editor.app.run_startup_checks"), patch(
+                "pdf_editor.app.get_pdf_page_count", return_value=2
+            ):
+                with redirect_stdout(stdout):
+                    exit_code = run_non_interactive(args)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(
+                [Path(path).name for path in payload["summary"]["planned_output_files"]],
+                ["Alex [order-8].pdf", "Alex [order-9].pdf"],
+            )
+
+    def test_split_non_empty_output_dir_with_rename_policy_validates_clean(self) -> None:
+        from unittest.mock import patch
+
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            sheet_path = base_dir / "employees.xlsx"
+            create_minimal_xlsx(sheet_path)
+            pdf_path = base_dir / "source.pdf"
+            pdf_path.write_bytes(b"pdf")
+            output_dir = base_dir / "out"
+            output_dir.mkdir()
+            (output_dir / "old.txt").write_text("x", encoding="utf-8")
+            args = make_args(
+                mode="split",
+                sheet_path=str(sheet_path),
+                pdf_path=str(pdf_path),
+                output_dir=str(output_dir),
+                on_output_exists="rename",
+                dry_run=True,
+                json=True,
+            )
+            stdout = io.StringIO()
+            with patch("pdf_editor.app.run_startup_checks"), patch(
+                "pdf_editor.app.get_pdf_page_count", return_value=2
+            ):
+                with redirect_stdout(stdout):
+                    exit_code = run_non_interactive(args)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(payload["status"], "ok")
+            self.assertEqual(payload["summary"]["output_exists_policy"], "rename")
+
+    def test_simple_merge_dry_run_fails_when_explicit_output_exists(self) -> None:
+        from unittest.mock import patch
+
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            first_pdf = base_dir / "first.pdf"
+            second_pdf = base_dir / "second.pdf"
+            output_path = base_dir / "merged.pdf"
+            first_pdf.write_bytes(b"first")
+            second_pdf.write_bytes(b"second")
+            output_path.write_text("existing", encoding="utf-8")
+            args = make_args(
+                mode="merge",
+                merge_kind="simple",
+                first_pdf_path=str(first_pdf),
+                second_pdf_path=str(second_pdf),
+                output_path=str(output_path),
+                dry_run=True,
+                json=True,
+            )
+            stdout = io.StringIO()
+            with patch("pdf_editor.app.run_startup_checks"), patch(
+                "pdf_editor.app.get_pdf_page_count", side_effect=[2, 3]
+            ):
+                with redirect_stdout(stdout):
+                    exit_code = run_non_interactive(args)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(payload["status"], "error")
+            self.assertEqual(payload["mode"], "merge")
+            self.assertEqual(payload["merge_kind"], "simple")
+            self.assertTrue(payload["summary"]["output_conflict"])
+
+    def test_simple_merge_rename_policy_executes_to_counter_path(self) -> None:
+        from unittest.mock import patch
+
+        class FakeReader:
+            def __init__(self, path: str) -> None:
+                self.pages = [f"{Path(path).stem}-page-1"]
+
+        class FakeWriter:
+            def __init__(self) -> None:
+                self.pages: list[str] = []
+
+            def add_page(self, page: str) -> None:
+                self.pages.append(page)
+
+            def write(self, handle) -> None:
+                handle.write("\n".join(self.pages).encode("utf-8"))
+
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            first_pdf = base_dir / "first.pdf"
+            second_pdf = base_dir / "second.pdf"
+            output_path = base_dir / "merged.pdf"
+            first_pdf.write_bytes(b"first")
+            second_pdf.write_bytes(b"second")
+            output_path.write_text("existing", encoding="utf-8")
+            args = make_args(
+                mode="merge",
+                merge_kind="simple",
+                first_pdf_path=str(first_pdf),
+                second_pdf_path=str(second_pdf),
+                output_path=str(output_path),
+                on_output_exists="rename",
+                json=True,
+            )
+            stdout = io.StringIO()
+            with patch("pdf_editor.app.run_startup_checks"), patch(
+                "pdf_editor.app.get_pdf_page_count", side_effect=[1, 1, 1, 1]
+            ), patch("pdf_editor.app.load_pdf_tools", return_value=(FakeReader, FakeWriter)), patch(
+                "pdf_editor.app.write_merge_report"
+            ):
+                with redirect_stdout(stdout):
+                    exit_code = run_non_interactive(args)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(Path(payload["result"]["output_file"]).name, "merged (2).pdf")
+            self.assertEqual([Path(path).name for path in payload["result"]["renamed_files"]], ["merged (2).pdf"])
+
+    def test_simple_merge_overwrite_policy_overwrites_requested_path(self) -> None:
+        from unittest.mock import patch
+
+        class FakeReader:
+            def __init__(self, path: str) -> None:
+                self.pages = [f"{Path(path).stem}-page-1"]
+
+        class FakeWriter:
+            def __init__(self) -> None:
+                self.pages: list[str] = []
+
+            def add_page(self, page: str) -> None:
+                self.pages.append(page)
+
+            def write(self, handle) -> None:
+                handle.write("\n".join(self.pages).encode("utf-8"))
+
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            first_pdf = base_dir / "first.pdf"
+            second_pdf = base_dir / "second.pdf"
+            output_path = base_dir / "merged.pdf"
+            first_pdf.write_bytes(b"first")
+            second_pdf.write_bytes(b"second")
+            output_path.write_text("existing", encoding="utf-8")
+            args = make_args(
+                mode="merge",
+                merge_kind="simple",
+                first_pdf_path=str(first_pdf),
+                second_pdf_path=str(second_pdf),
+                output_path=str(output_path),
+                on_output_exists="overwrite",
+                json=True,
+            )
+            stdout = io.StringIO()
+            with patch("pdf_editor.app.run_startup_checks"), patch(
+                "pdf_editor.app.get_pdf_page_count", side_effect=[1, 1, 1, 1]
+            ), patch("pdf_editor.app.load_pdf_tools", return_value=(FakeReader, FakeWriter)), patch(
+                "pdf_editor.app.write_merge_report"
+            ):
+                with redirect_stdout(stdout):
+                    exit_code = run_non_interactive(args)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(Path(payload["result"]["output_file"]).name, "merged.pdf")
+            self.assertEqual([Path(path).name for path in payload["result"]["overwritten_files"]], ["merged.pdf"])
+
+    def test_batch_merge_dry_run_fails_on_non_empty_output_dir(self) -> None:
+        from unittest.mock import patch
+
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            input_dir = base_dir / "Split Output"
+            input_dir.mkdir()
+            (input_dir / "A.pdf").write_bytes(b"a")
+            fixed_pdf = base_dir / "fixed.pdf"
+            fixed_pdf.write_bytes(b"fixed")
+            output_dir = base_dir / "Batch Output"
+            output_dir.mkdir()
+            (output_dir / "old.pdf").write_bytes(b"old")
+            args = make_args(
+                mode="merge",
+                merge_kind="batch",
+                batch_input_dir=str(input_dir),
+                fixed_pdf_path=str(fixed_pdf),
+                batch_output_dir=str(output_dir),
+                dry_run=True,
+                json=True,
+            )
+            stdout = io.StringIO()
+            with patch("pdf_editor.app.run_startup_checks"), patch(
+                "pdf_editor.app.get_pdf_page_count", return_value=1
+            ):
+                with redirect_stdout(stdout):
+                    exit_code = run_non_interactive(args)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(payload["status"], "error")
+            self.assertTrue(payload["summary"]["output_dir_conflict"])
+
+    def test_batch_merge_non_empty_output_dir_with_rename_policy_validates_clean(self) -> None:
+        from unittest.mock import patch
+
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            input_dir = base_dir / "Split Output"
+            input_dir.mkdir()
+            (input_dir / "A.pdf").write_bytes(b"a")
+            fixed_pdf = base_dir / "fixed.pdf"
+            fixed_pdf.write_bytes(b"fixed")
+            output_dir = base_dir / "Batch Output"
+            output_dir.mkdir()
+            (output_dir / "old.pdf").write_bytes(b"old")
+            args = make_args(
+                mode="merge",
+                merge_kind="batch",
+                batch_input_dir=str(input_dir),
+                fixed_pdf_path=str(fixed_pdf),
+                batch_output_dir=str(output_dir),
+                on_output_exists="rename",
+                dry_run=True,
+                json=True,
+            )
+            stdout = io.StringIO()
+            with patch("pdf_editor.app.run_startup_checks"), patch(
+                "pdf_editor.app.get_pdf_page_count", return_value=1
+            ):
+                with redirect_stdout(stdout):
+                    exit_code = run_non_interactive(args)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(payload["status"], "ok")
+            self.assertEqual(payload["summary"]["output_exists_policy"], "rename")
+
+    def test_batch_merge_rename_policy_preserves_existing_files_and_renames_outputs(self) -> None:
+        from unittest.mock import patch
+
+        class FakeReader:
+            def __init__(self, path: str) -> None:
+                self.pages = [f"{Path(path).stem}-page-1"]
+
+        class FakeWriter:
+            def __init__(self) -> None:
+                self.pages: list[str] = []
+
+            def add_page(self, page: str) -> None:
+                self.pages.append(page)
+
+            def write(self, handle) -> None:
+                handle.write("\n".join(self.pages).encode("utf-8"))
+
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            input_dir = base_dir / "Split Output"
+            input_dir.mkdir()
+            (input_dir / "A.pdf").write_bytes(b"a")
+            fixed_pdf = base_dir / "fixed.pdf"
+            fixed_pdf.write_bytes(b"fixed")
+            output_dir = base_dir / "Batch Output"
+            output_dir.mkdir()
+            (output_dir / "A.pdf").write_text("existing", encoding="utf-8")
+            args = make_args(
+                mode="merge",
+                merge_kind="batch",
+                batch_input_dir=str(input_dir),
+                fixed_pdf_path=str(fixed_pdf),
+                batch_output_dir=str(output_dir),
+                on_output_exists="rename",
+                json=True,
+            )
+            stdout = io.StringIO()
+            with patch("pdf_editor.app.run_startup_checks"), patch(
+                "pdf_editor.app.get_pdf_page_count", side_effect=[1, 1, 1]
+            ), patch("pdf_editor.app.load_pdf_tools", return_value=(FakeReader, FakeWriter)), patch(
+                "pdf_editor.app.write_batch_merge_report"
+            ):
+                with redirect_stdout(stdout):
+                    exit_code = run_non_interactive(args)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(exit_code, 0)
+            self.assertEqual([Path(path).name for path in payload["result"]["renamed_files"]], ["A (2).pdf"])
 
     def test_parse_simulated_missing_deps(self) -> None:
         self.assertEqual(parse_simulated_missing_deps("pypdf, other "), ["pypdf", "other"])
